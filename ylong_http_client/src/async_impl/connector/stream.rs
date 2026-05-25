@@ -70,6 +70,10 @@ impl<T> ConnInfo for HttpStream<T> {
         self.conn_data.is_proxy()
     }
 
+    fn proxy_auth(&self) -> Option<String> {
+        self.conn_data.proxy_auth()
+    }
+
     fn conn_data(&self) -> ConnData {
         self.conn_data.clone()
     }

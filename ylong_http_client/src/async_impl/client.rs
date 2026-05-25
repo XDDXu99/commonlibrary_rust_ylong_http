@@ -335,6 +335,10 @@ pub struct ClientBuilder {
     /// Options and flags that is related to `TLS`.
     #[cfg(feature = "__tls")]
     tls: crate::util::TlsConfigBuilder,
+
+    /// Options and flags that is related to proxy `TLS`.
+    #[cfg(feature = "__tls")]
+    proxy_tls: crate::util::TlsConfigBuilder,
 }
 
 impl ClientBuilder {
@@ -358,6 +362,8 @@ impl ClientBuilder {
             resolver: Arc::new(DefaultDnsResolver::default()),
             #[cfg(feature = "__tls")]
             tls: crate::util::TlsConfig::builder(),
+            #[cfg(feature = "__tls")]
+            proxy_tls: crate::util::TlsConfig::builder(),
         }
     }
 
@@ -636,19 +642,26 @@ impl ClientBuilder {
             HttpVersion::Http3 => origin_builder.alpn_protos(AlpnProtocol::H3.wire_format_bytes()),
         };
 
+        let proxies = self.proxies;
         let config = ConnectorConfig {
-            proxies: self.proxies,
+            proxies: proxies.clone(),
             #[cfg(all(target_os = "linux", feature = "ylong_base", feature = "__tls"))]
             fchown: self.fchown,
             #[cfg(feature = "__tls")]
             tls: tls_builder.build()?,
+            #[cfg(feature = "__tls")]
+            proxy_tls: self.proxy_tls.build()?,
             timeout: self.client.connect_timeout.clone(),
         };
 
         let connector = HttpConnector::new(config, self.resolver);
+        #[cfg(feature = "__tls")]
+        let tls_config_key = Some(crate::util::pool::TlsConfigKey::next());
+        #[cfg(not(feature = "__tls"))]
+        let tls_config_key = None;
 
         Ok(Client {
-            inner: ConnPool::new(self.http, connector),
+            inner: ConnPool::new_with_proxies(self.http, connector, proxies, tls_config_key),
             config: self.client,
             interceptors: self.interceptors,
         })
@@ -868,6 +881,22 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the maximum allowed TLS version for HTTPS proxy connections.
+    ///
+    /// This only affects the TLS session established with an HTTPS proxy.
+    pub fn proxy_max_tls_version(mut self, version: crate::util::TlsVersion) -> Self {
+        self.proxy_tls = self.proxy_tls.max_proto_version(version);
+        self
+    }
+
+    /// Sets the minimum required TLS version for HTTPS proxy connections.
+    ///
+    /// This only affects the TLS session established with an HTTPS proxy.
+    pub fn proxy_min_tls_version(mut self, version: crate::util::TlsVersion) -> Self {
+        self.proxy_tls = self.proxy_tls.min_proto_version(version);
+        self
+    }
+
     /// Adds a custom root certificate.
     ///
     /// This can be used to connect to a server that has a self-signed.
@@ -934,6 +963,46 @@ impl ClientBuilder {
         self
     }
 
+    /// Loads trusted root certificates from a file for HTTPS proxy TLS.
+    ///
+    /// This only affects the TLS session established with an HTTPS proxy.
+    pub fn proxy_tls_ca_file(mut self, path: &str) -> Self {
+        self.proxy_tls = self.proxy_tls.ca_file(path);
+        self
+    }
+
+    /// Loads a client certificate from a file for HTTPS proxy mTLS.
+    ///
+    /// This only affects the TLS session established with an HTTPS proxy.
+    pub fn proxy_tls_certificate_file(
+        mut self,
+        path: &str,
+        file_type: crate::util::TlsFileType,
+    ) -> Self {
+        self.proxy_tls = self.proxy_tls.certificate_file(path, file_type);
+        self
+    }
+
+    /// Loads a client certificate chain from a file for HTTPS proxy mTLS.
+    ///
+    /// This only affects the TLS session established with an HTTPS proxy.
+    pub fn proxy_tls_certificate_chain_file(mut self, path: &str) -> Self {
+        self.proxy_tls = self.proxy_tls.certificate_chain_file(path);
+        self
+    }
+
+    /// Loads a client private key from a file for HTTPS proxy mTLS.
+    ///
+    /// This only affects the TLS session established with an HTTPS proxy.
+    pub fn proxy_tls_private_key_file(
+        mut self,
+        path: &str,
+        file_type: crate::util::TlsFileType,
+    ) -> Self {
+        self.proxy_tls = self.proxy_tls.private_key_file(path, file_type);
+        self
+    }
+
     /// Sets the list of supported ciphers for protocols before `TLSv1.3`.
     ///
     /// See [`ciphers`] for details on the format.
@@ -953,6 +1022,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the list of supported ciphers for HTTPS proxy TLS before `TLSv1.3`.
+    ///
+    /// This only affects the TLS session established with an HTTPS proxy.
+    pub fn proxy_tls_cipher_list(mut self, list: &str) -> Self {
+        self.proxy_tls = self.proxy_tls.cipher_list(list);
+        self
+    }
+
     /// Controls the use of built-in system certificates during certificate
     /// validation. Default to `true` -- uses built-in system certs.
     ///
@@ -965,6 +1042,12 @@ impl ClientBuilder {
     /// ```
     pub fn tls_built_in_root_certs(mut self, is_use: bool) -> Self {
         self.tls = self.tls.build_in_root_certs(is_use);
+        self
+    }
+
+    /// Controls the use of built-in system certificates for HTTPS proxy TLS.
+    pub fn proxy_tls_built_in_root_certs(mut self, is_use: bool) -> Self {
+        self.proxy_tls = self.proxy_tls.build_in_root_certs(is_use);
         self
     }
 
@@ -985,6 +1068,18 @@ impl ClientBuilder {
     /// ```
     pub fn danger_accept_invalid_certs(mut self, is_invalid: bool) -> Self {
         self.tls = self.tls.danger_accept_invalid_certs(is_invalid);
+        self
+    }
+
+    /// Controls certificate verification for HTTPS proxy TLS.
+    ///
+    /// Defaults to `false` -- verify proxy certificates.
+    ///
+    /// # Warning
+    ///
+    /// When sets `true`, any HTTPS proxy certificate will be trusted for use.
+    pub fn danger_accept_invalid_proxy_certs(mut self, is_invalid: bool) -> Self {
+        self.proxy_tls = self.proxy_tls.danger_accept_invalid_certs(is_invalid);
         self
     }
 
@@ -1009,6 +1104,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Controls hostname verification for HTTPS proxy TLS.
+    ///
+    /// Defaults to `false` -- verify proxy hostname.
+    pub fn danger_accept_invalid_proxy_hostnames(mut self, is_invalid: bool) -> Self {
+        self.proxy_tls = self.proxy_tls.danger_accept_invalid_hostnames(is_invalid);
+        self
+    }
+
     /// Controls the use of TLS server name indication.
     ///
     /// Defaults to `true` -- sets sni.
@@ -1022,6 +1125,14 @@ impl ClientBuilder {
     /// ```
     pub fn tls_sni(mut self, is_set_sni: bool) -> Self {
         self.tls = self.tls.sni(is_set_sni);
+        self
+    }
+
+    /// Controls TLS server name indication for HTTPS proxy TLS.
+    ///
+    /// Defaults to `true` -- sets SNI with the proxy host.
+    pub fn proxy_tls_sni(mut self, is_set_sni: bool) -> Self {
+        self.proxy_tls = self.proxy_tls.sni(is_set_sni);
         self
     }
 
@@ -1087,7 +1198,7 @@ mod ut_async_impl_client {
     #[cfg(all(feature = "__tls", feature = "ylong_base"))]
     use crate::{CertVerifier, ServerCerts};
     #[cfg(feature = "__tls")]
-    use crate::{Certificate, TlsVersion};
+    use crate::{Certificate, TlsFileType, TlsVersion};
     use crate::{Proxy, Timeout};
 
     #[cfg(all(feature = "__tls", feature = "ylong_base"))]
@@ -1278,6 +1389,29 @@ HJMRZVCQpSMzvHlofHSNgzWV1MX5h1CP4SGZdBDTfA==
             .danger_accept_invalid_certs(false)
             .danger_accept_invalid_hostnames(false)
             .tls_sni(false)
+            .build();
+
+        assert!(client.is_err());
+    }
+
+    /// UT test cases for HTTPS proxy TLS options of `ClientBuilder::build`.
+    ///
+    /// # Brief
+    /// 1. Creates a ClientBuilder by calling `Client::builder`.
+    /// 2. Sets HTTPS proxy TLS certificate, private key, ciphers, and versions.
+    /// 3. Checks if invalid file paths are reported during build.
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn ut_client_build_proxy_tls_options() {
+        let client = Client::builder()
+            .proxy_max_tls_version(TlsVersion::TLS_1_3)
+            .proxy_min_tls_version(TlsVersion::TLS_1_0)
+            .proxy_tls_certificate_file("cert.pem", TlsFileType::PEM)
+            .proxy_tls_certificate_chain_file("cert-chain.pem")
+            .proxy_tls_private_key_file("key.pem", TlsFileType::PEM)
+            .proxy_tls_cipher_list(
+                "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK",
+            )
             .build();
 
         assert!(client.is_err());

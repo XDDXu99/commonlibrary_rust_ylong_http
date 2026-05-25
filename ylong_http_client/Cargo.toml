@@ -86,6 +86,11 @@ path = "examples/async_proxy_http.rs"
 required-features = ["async", "http1_1", "tokio_base"]
 
 [[example]]
+name = "async_https_proxy"
+path = "examples/async_https_proxy.rs"
+required-features = ["async", "http1_1", "tokio_base", "tls_default"]
+
+[[example]]
 name = "async_redirect_http"
 path = "examples/async_redirect_http.rs"
 required-features = ["async", "http1_1", "tokio_base"]

@@ -196,6 +196,24 @@ impl TlsConfigBuilder {
         self
     }
 
+    /// Loads a private key from a file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::{TlsConfigBuilder, TlsFileType};
+    ///
+    /// let builder = TlsConfigBuilder::new().private_key_file("key.pem", TlsFileType::PEM);
+    /// ```
+    pub fn private_key_file<T: AsRef<Path>>(mut self, path: T, file_type: TlsFileType) -> Self {
+        self.inner = self.inner.and_then(|mut builder| {
+            builder
+                .set_private_key_file(path, file_type.into_inner())
+                .map(|_| builder)
+        });
+        self
+    }
+
     /// Adds custom root certificate.
     ///
     /// # Examples
@@ -730,6 +748,21 @@ mod ut_openssl_adapter {
     fn ut_set_certificate_chain_file() {
         let builder = TlsConfigBuilder::new()
             .certificate_chain_file("cert.pem")
+            .build();
+        assert!(builder.is_err());
+    }
+
+    /// UT test cases for `TlsConfigBuilder::private_key_file`.
+    ///
+    /// # Brief
+    /// 1. Creates a `TlsConfigBuilder` by calling `TlsConfigBuilder::new`.
+    /// 2. Calls `private_key_file`.
+    /// 3. Provides an invalid path as argument.
+    /// 4. Checks if the result is as expected.
+    #[test]
+    fn ut_set_private_key_file() {
+        let builder = TlsConfigBuilder::new()
+            .private_key_file("key.pem", TlsFileType::PEM)
             .build();
         assert!(builder.is_err());
     }

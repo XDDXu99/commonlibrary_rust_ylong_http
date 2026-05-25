@@ -37,8 +37,9 @@ use crate::util::config::H3Config;
 use crate::util::config::{HttpConfig, HttpVersion};
 use crate::util::dispatcher::http1::{WrappedSemPermit, WrappedSemaphore};
 use crate::util::dispatcher::{Conn, ConnDispatcher, Dispatcher, TimeInfoConn};
-use crate::util::pool::{Pool, PoolKey};
+use crate::util::pool::{Pool, PoolKey, TlsConfigKey};
 use crate::util::progress::SpeedConfig;
+use crate::util::proxy::Proxies;
 #[cfg(feature = "http3")]
 use crate::util::request::RequestArc;
 use crate::util::ConnInfo;
@@ -52,6 +53,8 @@ pub(crate) struct ConnPool<C, S> {
     alt_svcs: AltServiceMap,
     connector: Arc<C>,
     config: HttpConfig,
+    proxies: Proxies,
+    tls_config_key: Option<TlsConfigKey>,
 }
 
 impl<C: Connector> ConnPool<C, C::Stream> {
@@ -62,6 +65,25 @@ impl<C: Connector> ConnPool<C, C::Stream> {
             alt_svcs: AltServiceMap::new(),
             connector: Arc::new(connector),
             config,
+            proxies: Proxies::default(),
+            tls_config_key: None,
+        }
+    }
+
+    pub(crate) fn new_with_proxies(
+        config: HttpConfig,
+        connector: C,
+        proxies: Proxies,
+        tls_config_key: Option<TlsConfigKey>,
+    ) -> Self {
+        Self {
+            pool: Pool::new(),
+            #[cfg(feature = "http3")]
+            alt_svcs: AltServiceMap::new(),
+            connector: Arc::new(connector),
+            config,
+            proxies,
+            tls_config_key,
         }
     }
 
@@ -69,10 +91,7 @@ impl<C: Connector> ConnPool<C, C::Stream> {
         &self,
         uri: &Uri,
     ) -> Result<TimeInfoConn<C::Stream>, HttpClientError> {
-        let key = PoolKey::new(
-            uri.scheme().unwrap().clone(),
-            uri.authority().unwrap().clone(),
-        );
+        let key = self.pool_key(uri);
 
         #[cfg(feature = "http3")]
         let alt_svc = self.alt_svcs.get_alt_svcs(&key);
@@ -96,6 +115,31 @@ impl<C: Connector> ConnPool<C, C::Stream> {
     #[cfg(feature = "http3")]
     pub(crate) fn set_alt_svcs(&self, request: RequestArc, response: &Response) {
         self.alt_svcs.set_alt_svcs(request, response);
+    }
+
+    fn pool_key(&self, uri: &Uri) -> PoolKey {
+        let target_scheme = uri.scheme().unwrap().clone();
+        let target_authority = uri.authority().unwrap().clone();
+        if let Some(proxy) = self.proxies.match_proxy(uri) {
+            let info = proxy.intercept.proxy_info();
+            let key = PoolKey::with_proxy(
+                target_scheme,
+                target_authority,
+                info.scheme().clone(),
+                info.authority().clone(),
+                info.basic_auth.as_ref().and_then(|v| v.to_string().ok()),
+            );
+            return self.with_tls_config(key);
+        }
+        self.with_tls_config(PoolKey::new(target_scheme, target_authority))
+    }
+
+    fn with_tls_config(&self, key: PoolKey) -> PoolKey {
+        if let Some(tls_config_key) = &self.tls_config_key {
+            key.with_tls_config(tls_config_key.clone())
+        } else {
+            key
+        }
     }
 }
 

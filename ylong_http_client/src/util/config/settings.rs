@@ -321,6 +321,11 @@ impl Default for SpeedLimit {
 /// - set username and password to login proxy server.
 /// - set no proxy which can keep origin uri not to be replaced by proxy uri.
 ///
+/// `Proxy::http`, `Proxy::https`, and `Proxy::all` describe which request
+/// schemes are intercepted. The scheme in the proxy URL describes the proxy
+/// transport, so `Proxy::all("https://proxy.example:8443")` uses an HTTPS
+/// proxy.
+///
 /// # Examples
 ///
 /// ```

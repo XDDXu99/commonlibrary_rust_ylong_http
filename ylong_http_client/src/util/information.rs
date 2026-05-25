@@ -23,6 +23,11 @@ pub trait ConnInfo {
     /// Whether the current connection is a proxy.
     fn is_proxy(&self) -> bool;
 
+    /// Gets the proxy authorization value if this connection uses proxy auth.
+    fn proxy_auth(&self) -> Option<String> {
+        None
+    }
+
     /// Gets connection information data.
     fn conn_data(&self) -> ConnData;
 
@@ -92,6 +97,7 @@ pub struct ConnData {
     #[cfg(feature = "http2")]
     negotiate: NegotiateInfo,
     proxy: bool,
+    proxy_auth: Option<String>,
     time_group: TimeGroup,
 }
 
@@ -114,6 +120,10 @@ impl ConnData {
         self.proxy
     }
 
+    pub(crate) fn proxy_auth(&self) -> Option<String> {
+        self.proxy_auth.clone()
+    }
+
     pub(crate) fn time_group_mut(&mut self) -> &mut TimeGroup {
         &mut self.time_group
     }
@@ -125,6 +135,7 @@ pub struct ConnDataBuilder {
     #[cfg(feature = "http2")]
     negotiate: NegotiateInfo,
     proxy: bool,
+    proxy_auth: Option<String>,
     time_group: TimeGroup,
 }
 
@@ -142,6 +153,12 @@ impl ConnDataBuilder {
         self
     }
 
+    /// Sets proxy authorization for requests sent directly to the proxy.
+    pub(crate) fn proxy_auth(mut self, proxy_auth: Option<String>) -> Self {
+        self.proxy_auth = proxy_auth;
+        self
+    }
+
     /// Set the time required for each phase of connection establishment.
     pub fn time_group(mut self, time_group: TimeGroup) -> Self {
         self.time_group = time_group;
@@ -155,6 +172,7 @@ impl ConnDataBuilder {
             #[cfg(feature = "http2")]
             negotiate: self.negotiate,
             proxy: self.proxy,
+            proxy_auth: self.proxy_auth,
             time_group: self.time_group,
         }
     }

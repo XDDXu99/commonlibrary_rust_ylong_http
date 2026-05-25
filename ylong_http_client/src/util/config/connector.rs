@@ -28,6 +28,9 @@ pub(crate) struct ConnectorConfig {
 
     #[cfg(feature = "__tls")]
     pub(crate) tls: crate::util::TlsConfig,
+
+    #[cfg(feature = "__tls")]
+    pub(crate) proxy_tls: crate::util::TlsConfig,
 }
 
 #[cfg(test)]

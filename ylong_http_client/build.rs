@@ -23,10 +23,13 @@ fn main() {
     let lib_dir = env::var("OPENSSL_LIB_DIR");
     let include_dir = env::var("OPENSSL_INCLUDE_DIR");
 
-    if let Ok(lib_dir) = lib_dir {
+    if env::var_os("CARGO_FEATURE___C_OPENSSL").is_some() {
         println!("cargo:rustc-link-lib=ssl");
         println!("cargo:rustc-link-lib=crypto");
-        println!("cargo:rustc-link-search=native={lib_dir}");
+
+        if let Ok(lib_dir) = lib_dir {
+            println!("cargo:rustc-link-search=native={lib_dir}");
+        }
     }
 
     if let Ok(include_dir) = include_dir {
