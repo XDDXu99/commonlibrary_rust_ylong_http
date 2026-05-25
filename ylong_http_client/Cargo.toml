@@ -91,6 +91,11 @@ path = "examples/async_https_proxy.rs"
 required-features = ["async", "http1_1", "tokio_base", "tls_default"]
 
 [[example]]
+name = "bench_https_proxy_ylong"
+path = "examples/bench_https_proxy_ylong.rs"
+required-features = ["async", "http1_1", "tokio_base", "tls_default"]
+
+[[example]]
 name = "async_redirect_http"
 path = "examples/async_redirect_http.rs"
 required-features = ["async", "http1_1", "tokio_base"]
