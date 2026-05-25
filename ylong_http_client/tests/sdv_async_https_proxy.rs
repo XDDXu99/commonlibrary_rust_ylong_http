@@ -24,11 +24,11 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::task::{Context, Poll};
 
-use openssl::ssl::{Ssl, SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
+use openssl::ssl::{NameType, Ssl, SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
@@ -39,7 +39,13 @@ use ylong_http_client::async_impl::{
 use ylong_http_client::{Proxy, TlsFileType, TlsVersion};
 
 const TEST_HOST: &str = "foobar.com";
+const PROXY_HOST: &str = "proxy.test";
+const TARGET_HOST: &str = "target.test";
+const WRONG_PROXY_HOST: &str = "wrong-proxy.test";
+const WRONG_TARGET_HOST: &str = "wrong-target.test";
 const PROXY_AUTH: &str = "Basic dXNlcjpwYXNz";
+
+type SniLog = Arc<Mutex<Vec<Option<String>>>>;
 
 enum ProxyIo {
     Plain(TcpStream),
@@ -121,26 +127,69 @@ fn cert_path(name: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn tls_acceptor(require_client_cert: bool) -> SslAcceptor {
+struct ServerTlsConfig {
+    cert_file: String,
+    key_file: String,
+    client_ca_file: Option<String>,
+    require_client_cert: bool,
+    sni_log: Option<SniLog>,
+}
+
+impl ServerTlsConfig {
+    fn new(cert_name: &str, key_name: &str) -> Self {
+        Self {
+            cert_file: cert_path(cert_name),
+            key_file: cert_path(key_name),
+            client_ca_file: None,
+            require_client_cert: false,
+            sni_log: None,
+        }
+    }
+
+    fn default_server(require_client_cert: bool) -> Self {
+        let mut config = Self::new("cert.pem", "key.pem");
+        if require_client_cert {
+            config.client_ca_file = Some(cert_path("root-ca.pem"));
+            config.require_client_cert = true;
+        }
+        config
+    }
+
+    fn with_sni_log(mut self, sni_log: SniLog) -> Self {
+        self.sni_log = Some(sni_log);
+        self
+    }
+}
+
+fn tls_acceptor(config: &ServerTlsConfig) -> SslAcceptor {
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
     builder
-        .set_private_key_file(cert_path("key.pem"), SslFiletype::PEM)
+        .set_private_key_file(&config.key_file, SslFiletype::PEM)
         .unwrap();
     builder
-        .set_certificate_chain_file(cert_path("cert.pem"))
+        .set_certificate_chain_file(&config.cert_file)
         .unwrap();
-    if require_client_cert {
-        builder.set_ca_file(cert_path("root-ca.pem")).unwrap();
+    if config.require_client_cert {
+        builder
+            .set_ca_file(config.client_ca_file.as_ref().unwrap())
+            .unwrap();
         builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    }
+    if let Some(sni_log) = config.sni_log.clone() {
+        builder.set_servername_callback(move |ssl, _| {
+            let servername = ssl.servername(NameType::HOST_NAME).map(str::to_owned);
+            sni_log.lock().unwrap().push(servername);
+            Ok(())
+        });
     }
     builder.build()
 }
 
-async fn accept_tls(
+async fn accept_tls_with_config(
     stream: TcpStream,
-    require_client_cert: bool,
+    config: ServerTlsConfig,
 ) -> Result<SslStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
-    let ssl = Ssl::new(tls_acceptor(require_client_cert).context())?;
+    let ssl = Ssl::new(tls_acceptor(&config).context())?;
     let mut stream = SslStream::new(ssl, stream)?;
     Pin::new(&mut stream).accept().await?;
     Ok(stream)
@@ -182,13 +231,35 @@ async fn start_proxy_with_client_auth(
     status: u16,
     require_client_cert: bool,
 ) -> ProxyHandle {
+    let tls_config = tls.then(|| ServerTlsConfig::default_server(require_client_cert));
+    start_proxy_with_tls_config(tls_config, target, status).await
+}
+
+async fn start_https_proxy_with_named_cert(
+    target: Option<SocketAddr>,
+    status: u16,
+    sni_log: SniLog,
+) -> ProxyHandle {
+    let tls_config = ServerTlsConfig::new(
+        "https_proxy_sni_proxy_cert.pem",
+        "https_proxy_sni_proxy_key.pem",
+    )
+    .with_sni_log(sni_log);
+    start_proxy_with_tls_config(Some(tls_config), target, status).await
+}
+
+async fn start_proxy_with_tls_config(
+    tls_config: Option<ServerTlsConfig>,
+    target: Option<SocketAddr>,
+    status: u16,
+) -> ProxyHandle {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = unbounded_channel();
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
-        let mut stream = if tls {
-            let Ok(tls_stream) = accept_tls(tcp, require_client_cert).await else {
+        let mut stream = if let Some(tls_config) = tls_config {
+            let Ok(tls_stream) = accept_tls_with_config(tcp, tls_config).await else {
                 return;
             };
             ProxyIo::Tls(tls_stream)
@@ -220,6 +291,19 @@ async fn start_proxy_with_client_auth(
 }
 
 async fn start_https_target() -> TargetHandle {
+    start_https_target_with_config(ServerTlsConfig::default_server(false)).await
+}
+
+async fn start_https_target_with_named_cert(sni_log: SniLog) -> TargetHandle {
+    let tls_config = ServerTlsConfig::new(
+        "https_proxy_sni_target_cert.pem",
+        "https_proxy_sni_target_key.pem",
+    )
+    .with_sni_log(sni_log);
+    start_https_target_with_config(tls_config).await
+}
+
+async fn start_https_target_with_config(tls_config: ServerTlsConfig) -> TargetHandle {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let accepted = Arc::new(AtomicBool::new(false));
@@ -228,7 +312,7 @@ async fn start_https_target() -> TargetHandle {
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         accepted_clone.store(true, Ordering::SeqCst);
-        let Ok(mut stream) = accept_tls(tcp, false).await else {
+        let Ok(mut stream) = accept_tls_with_config(tcp, tls_config).await else {
             return;
         };
         let head = read_headers(&mut stream).await.unwrap();
@@ -243,6 +327,14 @@ async fn start_https_target() -> TargetHandle {
         observed: rx,
         accepted,
     }
+}
+
+fn sni_log_contains(sni_log: &SniLog, expected: &str) -> bool {
+    sni_log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.as_deref() == Some(expected))
 }
 
 async fn request_via_proxy(
@@ -317,6 +409,186 @@ async fn request_via_proxy_with_client_cert(
         .body(Body::empty())
         .unwrap();
     client.request(request).await
+}
+
+async fn request_via_proxy_with_tls_paths(
+    url: String,
+    proxy: String,
+    proxy_tls_ca: Option<&str>,
+    proxy_danger_hostname: bool,
+    target_tls_ca: Option<&str>,
+    target_danger_hostname: bool,
+) -> Result<ylong_http_client::async_impl::Response, ylong_http_client::HttpClientError> {
+    let proxy = Proxy::all(proxy.as_str()).build().unwrap();
+    let mut builder = Client::builder().dns_resolver(LocalResolver).proxy(proxy);
+
+    if let Some(ca) = proxy_tls_ca {
+        builder = builder.proxy_tls_ca_file(ca);
+    }
+    if proxy_danger_hostname {
+        builder = builder.danger_accept_invalid_proxy_hostnames(true);
+    }
+    if let Some(ca) = target_tls_ca {
+        builder = builder.tls_ca_file(ca);
+    }
+    if target_danger_hostname {
+        builder = builder.danger_accept_invalid_hostnames(true);
+    }
+
+    let client = builder.build().unwrap();
+    let request = Request::builder()
+        .method("GET")
+        .url(url.as_str())
+        .body(Body::empty())
+        .unwrap();
+    client.request(request).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdv_proxy_tls_uses_proxy_hostname_for_verification() {
+    let proxy_sni = Arc::new(Mutex::new(Vec::new()));
+    let mut proxy = start_https_proxy_with_named_cert(None, 200, proxy_sni.clone()).await;
+    let proxy_ca = cert_path("https_proxy_sni_proxy_ca.pem");
+    let url = format!("http://{TARGET_HOST}:80/data");
+    let proxy_url = format!("https://{PROXY_HOST}:{}", proxy.port);
+
+    let response = request_via_proxy_with_tls_paths(
+        url,
+        proxy_url,
+        Some(proxy_ca.as_str()),
+        false,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    let head = proxy.observed.recv().await.unwrap();
+    assert!(head.starts_with(&format!("GET http://{TARGET_HOST}:80/data HTTP/1.1\r\n")));
+    assert!(
+        sni_log_contains(&proxy_sni, PROXY_HOST),
+        "{:?}",
+        proxy_sni.lock().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdv_target_tls_uses_target_hostname_after_proxy_tunnel() {
+    let proxy_sni = Arc::new(Mutex::new(Vec::new()));
+    let target_sni = Arc::new(Mutex::new(Vec::new()));
+    let mut target = start_https_target_with_named_cert(target_sni.clone()).await;
+    let target_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, target.port));
+    let mut proxy =
+        start_https_proxy_with_named_cert(Some(target_addr), 200, proxy_sni.clone()).await;
+    let proxy_ca = cert_path("https_proxy_sni_proxy_ca.pem");
+    let target_ca = cert_path("https_proxy_sni_target_ca.pem");
+    let url = format!("https://{TARGET_HOST}:{}/secure", target.port);
+    let proxy_url = format!("https://{PROXY_HOST}:{}", proxy.port);
+
+    let response = request_via_proxy_with_tls_paths(
+        url,
+        proxy_url,
+        Some(proxy_ca.as_str()),
+        false,
+        Some(target_ca.as_str()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    let connect = proxy.observed.recv().await.unwrap();
+    assert!(connect.starts_with(&format!(
+        "CONNECT {TARGET_HOST}:{} HTTP/1.1\r\n",
+        target.port
+    )));
+
+    let target_head = target.observed.recv().await.unwrap();
+    assert!(target_head.starts_with("GET /secure HTTP/1.1\r\n"));
+    assert!(
+        sni_log_contains(&proxy_sni, PROXY_HOST),
+        "{:?}",
+        proxy_sni.lock().unwrap()
+    );
+    assert!(
+        sni_log_contains(&target_sni, TARGET_HOST),
+        "{:?}",
+        target_sni.lock().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdv_proxy_hostname_mismatch_is_not_bypassed_by_target_config() {
+    let proxy_sni = Arc::new(Mutex::new(Vec::new()));
+    let target_sni = Arc::new(Mutex::new(Vec::new()));
+    let target = start_https_target_with_named_cert(target_sni.clone()).await;
+    let target_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, target.port));
+    let proxy = start_https_proxy_with_named_cert(Some(target_addr), 200, proxy_sni.clone()).await;
+    let proxy_ca = cert_path("https_proxy_sni_proxy_ca.pem");
+    let combined_ca = cert_path("https_proxy_sni_combined_ca.pem");
+    let url = format!("https://{TARGET_HOST}:{}/secure", target.port);
+    let proxy_url = format!("https://{WRONG_PROXY_HOST}:{}", proxy.port);
+
+    let result = request_via_proxy_with_tls_paths(
+        url,
+        proxy_url,
+        Some(proxy_ca.as_str()),
+        false,
+        Some(combined_ca.as_str()),
+        true,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!target.accepted.load(Ordering::SeqCst));
+    assert!(
+        sni_log_contains(&proxy_sni, WRONG_PROXY_HOST),
+        "{:?}",
+        proxy_sni.lock().unwrap()
+    );
+    assert!(target_sni.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdv_target_hostname_mismatch_is_not_bypassed_by_proxy_config() {
+    let proxy_sni = Arc::new(Mutex::new(Vec::new()));
+    let target_sni = Arc::new(Mutex::new(Vec::new()));
+    let target = start_https_target_with_named_cert(target_sni.clone()).await;
+    let target_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, target.port));
+    let mut proxy =
+        start_https_proxy_with_named_cert(Some(target_addr), 200, proxy_sni.clone()).await;
+    let combined_ca = cert_path("https_proxy_sni_combined_ca.pem");
+    let target_ca = cert_path("https_proxy_sni_target_ca.pem");
+    let url = format!("https://{WRONG_TARGET_HOST}:{}/secure", target.port);
+    let proxy_url = format!("https://{PROXY_HOST}:{}", proxy.port);
+
+    let result = request_via_proxy_with_tls_paths(
+        url,
+        proxy_url,
+        Some(combined_ca.as_str()),
+        true,
+        Some(target_ca.as_str()),
+        false,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(target.accepted.load(Ordering::SeqCst));
+
+    let connect = proxy.observed.recv().await.unwrap();
+    assert!(connect.starts_with(&format!(
+        "CONNECT {WRONG_TARGET_HOST}:{} HTTP/1.1\r\n",
+        target.port
+    )));
+    assert!(
+        sni_log_contains(&proxy_sni, PROXY_HOST),
+        "{:?}",
+        proxy_sni.lock().unwrap()
+    );
+    assert!(
+        sni_log_contains(&target_sni, WRONG_TARGET_HOST),
+        "{:?}",
+        target_sni.lock().unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
