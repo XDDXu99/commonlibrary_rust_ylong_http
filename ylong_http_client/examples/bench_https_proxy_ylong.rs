@@ -62,7 +62,18 @@ struct YlongBenchConfig {
     proxy_insecure: bool,
     requests: usize,
     concurrency: usize,
+    response_size: usize,
     keep_alive: bool,
+}
+
+#[derive(Default)]
+struct WorkerReport {
+    latencies: Vec<f64>,
+    first_ms: Option<f64>,
+    steady_sum_ms: f64,
+    steady_count: usize,
+    errors: usize,
+    body_bytes: usize,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -82,16 +93,18 @@ async fn main() -> Result<(), BenchError> {
             let requests = arg_value(&args, "--requests", "1000").parse::<usize>()?;
             let concurrency = arg_value(&args, "--concurrency", "10").parse::<usize>()?;
             let config = YlongBenchConfig {
-                target_url: arg_value(
-                    &args,
-                    "--target-url",
-                    "http://foobar.com:18080/bench",
-                ),
+                target_url: arg_value(&args, "--target-url", "http://foobar.com:18080/bench"),
                 proxy_url: arg_value(&args, "--proxy-url", "https://foobar.com:18443"),
                 proxy_ca: optional_arg(&args, "--proxy-ca"),
                 proxy_insecure: has_flag(&args, "--proxy-insecure"),
                 requests,
                 concurrency,
+                response_size: arg_value(
+                    &args,
+                    "--response-size",
+                    DEFAULT_BODY_SIZE.to_string().as_str(),
+                )
+                .parse::<usize>()?,
                 keep_alive: !has_flag(&args, "--cold"),
             };
             run_ylong(config).await
@@ -108,7 +121,7 @@ fn print_usage() {
         "Usage:\n  bench_https_proxy_ylong serve [--target-addr ADDR] [--proxy-addr ADDR] \\
          [--cert PEM] [--key PEM] [--body-size N]\n  bench_https_proxy_ylong ylong \\
          --target-url URL --proxy-url URL [--proxy-ca PEM|--proxy-insecure] \\
-         --requests N --concurrency N [--keep-alive|--cold]"
+         --requests N --concurrency N [--response-size N] [--keep-alive|--cold]"
     );
 }
 
@@ -242,7 +255,11 @@ async fn handle_proxy_connection(
                 .await
                 .map_err(|_| err)?;
         }
-        target.as_mut().expect("target stream must exist").flush().await?;
+        target
+            .as_mut()
+            .expect("target stream must exist")
+            .flush()
+            .await?;
 
         let response = read_response(target.as_mut().expect("target stream must exist")).await?;
         client.write_all(&response).await?;
@@ -291,7 +308,8 @@ where
 }
 
 fn rewrite_proxy_request(head: &[u8]) -> io::Result<(String, Vec<u8>)> {
-    let text = str::from_utf8(head).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let text =
+        str::from_utf8(head).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let mut lines = text.split("\r\n");
     let request_line = lines
         .next()
@@ -399,38 +417,88 @@ async fn run_ylong(config: YlongBenchConfig) -> Result<(), BenchError> {
             continue;
         }
         let config = config.clone();
-        handles.push(tokio::spawn(async move { run_ylong_worker(config, count).await }));
+        handles.push(tokio::spawn(async move {
+            run_ylong_worker(config, count)
+                .await
+                .map(|report| (worker, report))
+        }));
     }
 
     let mut latencies = Vec::with_capacity(config.requests);
+    let mut first_request_sum = 0.0;
+    let mut first_request_count = 0usize;
+    let mut steady_sum = 0.0;
+    let mut steady_count = 0usize;
+    let mut per_worker_errors = vec![0usize; config.concurrency];
+    let mut total_errors = 0usize;
+    let mut body_bytes = 0usize;
     for handle in handles {
-        let worker_latencies = handle.await.map_err(|err| err.to_string())??;
-        latencies.extend(worker_latencies);
+        let (worker, report) = handle.await.map_err(|err| err.to_string())??;
+        if let Some(first_ms) = report.first_ms {
+            first_request_sum += first_ms;
+            first_request_count += 1;
+        }
+        steady_sum += report.steady_sum_ms;
+        steady_count += report.steady_count;
+        if let Some(errors) = per_worker_errors.get_mut(worker) {
+            *errors = report.errors;
+        }
+        total_errors += report.errors;
+        body_bytes += report.body_bytes;
+        latencies.extend(report.latencies);
     }
     let total = started.elapsed();
-    print_stats("ylong", &config, total, &mut latencies);
+    let diagnostics = Diagnostics {
+        first_request_ms: average_or_zero(first_request_sum, first_request_count),
+        steady_avg_ms: average_or_zero(steady_sum, steady_count),
+        total_errors,
+        per_worker_errors,
+        body_bytes,
+    };
+    print_stats("ylong", &config, total, &mut latencies, diagnostics);
     Ok(())
 }
 
-async fn run_ylong_worker(config: YlongBenchConfig, count: usize) -> Result<Vec<f64>, BenchError> {
+async fn run_ylong_worker(
+    config: YlongBenchConfig,
+    count: usize,
+) -> Result<WorkerReport, BenchError> {
     let mut latencies = Vec::with_capacity(count);
+    let mut report = WorkerReport::default();
     let keep_alive_client = if config.keep_alive {
         Some(build_client(&config)?)
     } else {
         None
     };
 
-    for _ in 0..count {
+    for request_index in 0..count {
         let started = Instant::now();
-        if let Some(client) = keep_alive_client.as_ref() {
-            send_ylong_request(client, &config.target_url).await?;
+        let result = if let Some(client) = keep_alive_client.as_ref() {
+            send_ylong_request(client, &config.target_url).await
         } else {
             let client = build_client(&config)?;
-            send_ylong_request(&client, &config.target_url).await?;
+            send_ylong_request(&client, &config.target_url).await
+        };
+
+        match result {
+            Ok(bytes) => {
+                let latency = started.elapsed().as_secs_f64() * 1000.0;
+                if request_index == 0 {
+                    report.first_ms = Some(latency);
+                } else {
+                    report.steady_sum_ms += latency;
+                    report.steady_count += 1;
+                }
+                report.body_bytes += bytes;
+                latencies.push(latency);
+            }
+            Err(_) => {
+                report.errors += 1;
+            }
         }
-        latencies.push(started.elapsed().as_secs_f64() * 1000.0);
     }
-    Ok(latencies)
+    report.latencies = latencies;
+    Ok(report)
 }
 
 fn build_client(config: &YlongBenchConfig) -> Result<Client, BenchError> {
@@ -447,7 +515,7 @@ fn build_client(config: &YlongBenchConfig) -> Result<Client, BenchError> {
     Ok(builder.build()?)
 }
 
-async fn send_ylong_request(client: &Client, target_url: &str) -> Result<(), BenchError> {
+async fn send_ylong_request(client: &Client, target_url: &str) -> Result<usize, BenchError> {
     let request = Request::builder()
         .method("GET")
         .url(target_url)
@@ -457,11 +525,13 @@ async fn send_ylong_request(client: &Client, target_url: &str) -> Result<(), Ben
         return Err(format!("unexpected status {}", response.status().as_u16()).into());
     }
     let mut buf = [0u8; 4096];
+    let mut total = 0usize;
     loop {
         let read = response.data(&mut buf).await?;
         if read == 0 {
-            return Ok(());
+            return Ok(total);
         }
+        total += read;
     }
 }
 
@@ -476,22 +546,76 @@ fn print_stats(
     config: &YlongBenchConfig,
     total: Duration,
     latencies: &mut [f64],
+    diagnostics: Diagnostics,
 ) {
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let total_ms = total.as_secs_f64() * 1000.0;
-    let avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
+    let avg = average_or_zero(latencies.iter().sum::<f64>(), latencies.len());
     let p95 = percentile(latencies, 0.95);
     let p99 = percentile(latencies, 0.99);
+    let min = latencies.first().copied().unwrap_or(0.0);
+    let max = latencies.last().copied().unwrap_or(0.0);
     let rps = config.requests as f64 / total.as_secs_f64();
     let mode = if config.keep_alive {
         "keep-alive"
     } else {
         "cold"
     };
+    let per_worker_errors = diagnostics
+        .per_worker_errors
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let (requests_per_worker_min, requests_per_worker_max) =
+        worker_request_count_bounds(config.requests, config.concurrency);
     println!(
-        "client={client} mode={mode} requests={} concurrency={} total_ms={:.3} rps={:.3} avg_ms={:.3} p95_ms={:.3} p99_ms={:.3} errors=0",
-        config.requests, config.concurrency, total_ms, rps, avg, p95, p99
+        "client={client} mode={mode} requests={} concurrency={} total_ms={:.3} rps={:.3} avg_ms={:.3} p95_ms={:.3} p99_ms={:.3} first_request_ms={:.3} steady_avg_ms={:.3} min_ms={:.3} max_ms={:.3} body_bytes={} response_size={} workers={} requests_per_worker_min={} requests_per_worker_max={} total_errors={} per_worker_errors={} errors={}",
+        config.requests,
+        config.concurrency,
+        total_ms,
+        rps,
+        avg,
+        p95,
+        p99,
+        diagnostics.first_request_ms,
+        diagnostics.steady_avg_ms,
+        min,
+        max,
+        diagnostics.body_bytes,
+        config.response_size,
+        config.concurrency,
+        requests_per_worker_min,
+        requests_per_worker_max,
+        diagnostics.total_errors,
+        per_worker_errors,
+        diagnostics.total_errors
     );
+}
+
+struct Diagnostics {
+    first_request_ms: f64,
+    steady_avg_ms: f64,
+    total_errors: usize,
+    per_worker_errors: Vec<usize>,
+    body_bytes: usize,
+}
+
+fn average_or_zero(sum: f64, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f64
+    }
+}
+
+fn worker_request_count_bounds(requests: usize, concurrency: usize) -> (usize, usize) {
+    if concurrency == 0 {
+        return (0, 0);
+    }
+    let min = requests / concurrency;
+    let max = min + usize::from(requests % concurrency != 0);
+    (min, max)
 }
 
 fn percentile(latencies: &[f64], fraction: f64) -> f64 {
