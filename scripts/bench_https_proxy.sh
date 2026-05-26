@@ -281,13 +281,19 @@ build_libcurl_bench() {
         echo "libcurl_build=skipped reason=missing_cc hint=\"sudo apt install build-essential libcurl4-openssl-dev\""
         return 1
     fi
+    local cflags=()
+    local libs=(-lcurl)
+    if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libcurl; then
+        read -r -a cflags <<<"$(pkg-config --cflags libcurl)"
+        read -r -a libs <<<"$(pkg-config --libs libcurl)"
+    fi
     if ! printf '#include <curl/curl.h>\nint main(void){return 0;}\n' \
-        | cc -x c - -lcurl -o "$TMP_DIR/libcurl_probe" \
+        | cc -x c - "${cflags[@]}" "${libs[@]}" -o "$TMP_DIR/libcurl_probe" \
             >"$TMP_DIR/libcurl_probe.out" 2>"$TMP_DIR/libcurl_probe.err"; then
         echo "libcurl_build=skipped reason=missing_libcurl_dev hint=\"sudo apt install libcurl4-openssl-dev\""
         return 1
     fi
-    if ! cc "$LIBCURL_SRC" -O2 -Wall -Wextra -lcurl -o "$LIBCURL_BIN"; then
+    if ! cc "$LIBCURL_SRC" -O2 -Wall -Wextra "${cflags[@]}" "${libs[@]}" -o "$LIBCURL_BIN"; then
         echo "failed to build libcurl benchmark from $LIBCURL_SRC" >&2
         return 2
     fi
