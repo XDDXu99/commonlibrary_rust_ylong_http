@@ -49,9 +49,10 @@ scripts/bench_https_proxy.sh --client all --requests 100 --concurrency 1 --keep-
 
 ## Benchmark 架构
 
-脚本先构建 `ylong_http_client/examples/bench_https_proxy_ylong.rs`，再启动一个本地 HTTP
-target 和一个本地 HTTPS proxy。target 返回固定 `Content-Length` 响应体；proxy 使用
-TLS 接收客户端连接，并把 absolute-form HTTP 请求转发到 target。
+脚本使用 release profile 构建并运行
+`target/release/examples/bench_https_proxy_ylong`，再启动一个本地 HTTP target 和一个本地
+HTTPS proxy。target 返回固定 `Content-Length` 响应体；proxy 使用 TLS 接收客户端连接，
+并把 absolute-form HTTP 请求转发到 target。
 
 三组客户端使用同一个 target、同一个 HTTPS proxy、同一个 proxy CA、同一请求数、同一并发度、
 同一响应体大小和同一 keep-alive/cold 设置。`ylong` 使用自定义 resolver 把 benchmark
@@ -66,7 +67,8 @@ TLS 接收客户端连接，并把 absolute-form HTTP 请求转发到 target。
   由 curl 在进程内复用连接；请求输出到 `/dev/null`，会完整读取 body。
 - `libcurl`：C 小程序 `tools/bench_libcurl_https_proxy.c` 使用 libcurl multi API；每个
   worker 复用一个 easy handle，multi handle 管理并发和连接缓存；cold 模式设置
-  `CURLOPT_FRESH_CONNECT` 和 `CURLOPT_FORBID_REUSE`。
+  `CURLOPT_FRESH_CONNECT` 和 `CURLOPT_FORBID_REUSE`。脚本通过 `pkg-config` 获取 libcurl
+  编译参数，并使用 `cc -O2` 构建该 C 小程序。
 
 curl CLI benchmark 可作为 smoke benchmark，但它不完全等价于 libcurl multi API；最终性能
 结论应优先参考 libcurl multi 对照。
@@ -115,39 +117,48 @@ curl 7.81.0 (x86_64-pc-linux-gnu) libcurl/7.81.0 OpenSSL/3.0.2
 cc 11.4.0
 pkg-config libcurl: 7.81.0
 libcurl header: /usr/include/x86_64-linux-gnu/curl/curl.h
+ylong build: release
+libcurl build: cc -O2 with pkg-config cflags/libs
 ```
 
-基础验证结果如下：
+说明：早期 benchmark 脚本使用 debug profile 构建 ylong helper，而 libcurl C 程序使用
+`-O2`，该对比不公平。当前结果均来自 release ylong helper 和同一 release binary 提供的
+本地 target/proxy server。
+
+release 基础验证结果如下：
 
 | 场景 | client | total_ms | rps | avg_ms | p95_ms | p99_ms | first_request_ms | steady_avg_ms | 20%+ |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 100 req / 1 concurrency / 1KB / keep-alive | ylong | 25.563 | 3911.979 | 0.233 | 0.307 | 0.372 | 2.571 | 0.209 | 否 |
-| 100 req / 1 concurrency / 1KB / keep-alive | curl-cli | 30.335 | 3296.522 | 0.208 | 0.271 | 0.448 | 3.190 | 0.178 | 基线 |
-| 100 req / 1 concurrency / 1KB / keep-alive | libcurl | 18.984 | 5267.535 | 0.188 | 0.257 | 0.291 | 3.323 | 0.157 | 基线 |
-| 1000 req / 10 concurrency / 1KB / keep-alive | ylong | 72.915 | 13714.673 | 0.479 | 0.610 | 0.974 | 6.746 | 0.416 | 否 |
-| 1000 req / 10 concurrency / 1KB / keep-alive | curl-cli | 59.517 | 16801.922 | 0.428 | 0.533 | 0.687 | 5.421 | 0.378 | 基线 |
-| 1000 req / 10 concurrency / 1KB / keep-alive | libcurl | 45.425 | 22014.319 | 0.440 | 0.552 | 0.719 | 9.764 | 0.346 | 基线 |
+| 1000 req / 10 concurrency / 1KB / keep-alive | ylong | 48.883 | 20456.897 | 0.258 | 0.279 | 0.399 | 6.797 | 0.192 | 否 |
+| 1000 req / 10 concurrency / 1KB / keep-alive | curl-cli | 43.361 | 23062.199 | 0.278 | 0.357 | 0.503 | 4.463 | 0.235 | 基线 |
+| 1000 req / 10 concurrency / 1KB / keep-alive | libcurl | 26.943 | 37115.678 | 0.265 | 0.279 | 0.442 | 10.035 | 0.167 | 基线 |
+| 100 req / 1 concurrency / 1KB / cold | ylong | 204.928 | 487.976 | 2.049 | 2.240 | 3.143 | 4.322 | 2.026 | 否 |
+| 100 req / 1 concurrency / 1KB / cold | curl-cli | 695.489 | 143.784 | 2.927 | 3.319 | 3.441 | 3.276 | 2.923 | 基线 |
+| 100 req / 1 concurrency / 1KB / cold | libcurl | 179.562 | 556.911 | 1.793 | 1.968 | 2.209 | 2.968 | 1.781 | 基线 |
 
-按总耗时计算，基础验证中 ylong 相对 curl CLI 分别为 `15.731%` 和 `-22.511%`；
-相对 libcurl multi 分别为 `-34.655%` 和 `-60.517%`。未达到 20%+ 性能提升目标。
+按总耗时计算，release 基础验证中 ylong 相对 libcurl multi 在 1000/c10/1KB keep-alive
+场景为 `-81.431%`；cold smoke 场景为 `-14.127%`。ylong 在 cold smoke 中相对 curl CLI
+快 `70.535%`，但 curl CLI 不是最终 libcurl 组件对照。未达到相对 libcurl multi 的
+20%+ 性能提升目标。
 
 三轮稳定性测试取各 client `total_ms` 中位数：
 
 | 场景 | client | median total_ms | median rps | 对 ylong 结论 |
 | --- | --- | ---: | ---: | --- |
-| 1000 req / 10 concurrency / 1KB / keep-alive | ylong | 75.746 | 13202.012 | - |
-| 1000 req / 10 concurrency / 1KB / keep-alive | curl-cli | 59.507 | 16804.746 | ylong 慢 `27.290%` |
-| 1000 req / 10 concurrency / 1KB / keep-alive | libcurl | 46.435 | 21535.325 | ylong 慢 `63.119%` |
-| 3000 req / 30 concurrency / 1KB / keep-alive | ylong | 119.728 | 25056.870 | - |
-| 3000 req / 30 concurrency / 1KB / keep-alive | curl-cli | 112.134 | 26753.705 | ylong 慢 `6.772%` |
-| 3000 req / 30 concurrency / 1KB / keep-alive | libcurl | 86.225 | 34792.721 | ylong 慢 `38.856%` |
-| 1000 req / 10 concurrency / 64KB / keep-alive | ylong | 4412.626 | 226.622 | - |
-| 1000 req / 10 concurrency / 64KB / keep-alive | curl-cli | 4461.921 | 224.119 | ylong 快 `1.105%` |
-| 1000 req / 10 concurrency / 64KB / keep-alive | libcurl | 4408.574 | 226.831 | ylong 慢 `0.092%` |
+| 1000 req / 10 concurrency / 1KB / keep-alive | ylong | 48.883 | 20456.897 | - |
+| 1000 req / 10 concurrency / 1KB / keep-alive | curl-cli | 43.711 | 22877.537 | ylong 慢 `11.831%` |
+| 1000 req / 10 concurrency / 1KB / keep-alive | libcurl | 28.643 | 34912.380 | ylong 慢 `70.663%` |
+| 3000 req / 30 concurrency / 1KB / keep-alive | ylong | 88.650 | 33841.069 | - |
+| 3000 req / 30 concurrency / 1KB / keep-alive | curl-cli | 87.345 | 34346.557 | ylong 慢 `1.494%` |
+| 3000 req / 30 concurrency / 1KB / keep-alive | libcurl | 79.097 | 37928.167 | ylong 慢 `12.078%` |
+| 1000 req / 10 concurrency / 64KB / keep-alive | ylong | 4434.731 | 225.493 | - |
+| 1000 req / 10 concurrency / 64KB / keep-alive | curl-cli | 4470.581 | 223.685 | ylong 快 `0.802%` |
+| 1000 req / 10 concurrency / 64KB / keep-alive | libcurl | 4366.644 | 229.009 | ylong 慢 `1.559%` |
 
 结论：本机实测未证明 ylong 在 HTTPS proxy 场景下相对 libcurl multi 达到 20%+。
-1KB 小响应场景 ylong 主要输在总耗时和稳定态请求延迟；64KB 响应场景三者接近，说明大响应下
-传输吞吐更接近，瓶颈更可能集中在小包调度、请求构造、解析或 buffer copy 路径。
+release 构建显著缩小了差距，但 1KB 小响应场景仍慢于 libcurl multi；64KB 响应场景三者
+接近，说明大响应下传输吞吐不是主要差异。cold smoke 中 ylong 快于 curl CLI，但仍慢于
+libcurl multi，不能用于证明相对 libcurl 达标。
 
 ## 后续优化方向
 

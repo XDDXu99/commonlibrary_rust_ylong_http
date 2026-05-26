@@ -114,7 +114,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-BIN="$REPO_ROOT/target/debug/examples/bench_https_proxy_ylong"
+BIN="$REPO_ROOT/target/release/examples/bench_https_proxy_ylong"
 LIBCURL_SRC="$REPO_ROOT/tools/bench_libcurl_https_proxy.c"
 LIBCURL_BIN="$REPO_ROOT/target/bench_libcurl_https_proxy"
 TMP_DIR="$(mktemp -d /tmp/ylong_https_proxy_bench.XXXXXX)"
@@ -129,8 +129,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "building benchmark helper..."
-cargo build -p ylong_http_client --features async,tokio_base,http1_1,tls_default --example bench_https_proxy_ylong >/dev/null
+echo "building benchmark helper profile=release..."
+cargo build --release -p ylong_http_client --features async,tokio_base,http1_1,tls_default --example bench_https_proxy_ylong >/dev/null
 
 "$BIN" serve \
     --target-addr "127.0.0.1:$TARGET_PORT" \
@@ -166,6 +166,7 @@ if [[ "$MODE" == "cold" ]]; then
 fi
 
 echo "server=$(grep '^READY ' "$TMP_DIR/server.log" | tail -1)"
+echo "ylong_build=release binary=$BIN"
 echo "target_url=$TARGET_URL"
 echo "proxy_url=$PROXY_URL"
 echo "curl_version=$(curl --version | sed -n '1p')"
