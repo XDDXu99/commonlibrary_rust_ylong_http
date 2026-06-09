@@ -78,10 +78,14 @@ proxy authority、proxy basic auth，以及 Client 构建时生成的 TLS 配置
 
 ## Benchmark 状态
 
-当前仓库尚未提交 HTTPS 代理与 libcurl 的性能对比结果，也不能声明已达到 20%+
-性能提升目标。有效 benchmark 需要使用相同的本地 HTTPS 代理、相同 HTTP target、
-相同请求数、并发度和 keep-alive 条件，并分别统计冷连接与连接复用场景。建议至少
-报告总耗时、吞吐量、平均延迟、P95 和 P99。
+仓库提供本地可复现的 ylong、curl CLI 和 libcurl multi 对照，详见
+[`https_proxy_benchmark.md`](https_proxy_benchmark.md)。2026-06-09 的五轮中位数复测中，
+HTTP target、100000 请求、并发 30、1KB、keep-alive 场景下，ylong 总耗时
+`1291.965ms`，libcurl 为 `1826.138ms`，ylong 快 `29.252%`，达到该限定场景的 20%+
+目标。
+
+该结论不能泛化到所有参数。64KB 场景基本持平，256KB 和低并发历史结果未达到 20%；
+文档同时保留 cold 与 HTTPS target over HTTPS proxy 的实测数据。
 
 ## 构建说明
 
