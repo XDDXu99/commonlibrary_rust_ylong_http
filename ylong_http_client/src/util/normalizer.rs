@@ -63,6 +63,14 @@ impl UriFormatter {
     }
 
     pub(crate) fn format(&self, uri: &mut Uri) -> Result<(), HttpClientError> {
+        if uri.scheme().is_some()
+            && uri.authority().is_some()
+            && uri.port().is_some()
+            && uri.path().is_some()
+        {
+            return Ok(());
+        }
+
         let host = match uri.host() {
             Some(host) => host.clone(),
             None => return err_from_msg!(Request, "No host in url"),
@@ -241,6 +249,12 @@ mod ut_normalizer {
         let uni = UriFormatter::new();
         let _ = uni.format(&mut uri);
         assert_eq!(uri.path().unwrap().as_str(), "/");
+
+        let mut uri = Uri::from_bytes(b"http://example.com:8080/foo?a=1").unwrap();
+        let expected = uri.to_string();
+        let uni = UriFormatter::new();
+        let _ = uni.format(&mut uri);
+        assert_eq!(uri.to_string(), expected);
     }
 
     /// UT test cases for `RequestFormatter::normalize`.

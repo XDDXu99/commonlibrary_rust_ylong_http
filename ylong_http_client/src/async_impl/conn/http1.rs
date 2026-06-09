@@ -48,7 +48,7 @@ where
     message
         .interceptor
         .intercept_request(message.request.ref_mut())?;
-    let mut buf = vec![0u8; TEMP_BUF_SIZE];
+    let mut buf = [0u8; TEMP_BUF_SIZE];
 
     message
         .request
@@ -192,17 +192,17 @@ where
 {
     // Encodes and sends Request-line and Headers(non-body fields).
     let mut part = request.part().clone();
-    let mut part_encoder = RequestEncoder::new(part.clone());
     if conn.raw_mut().is_proxy() && request.uri().scheme() == Some(&Scheme::HTTP) {
         if let Some(value) = conn.raw_mut().proxy_auth() {
             let value = format!("Basic {value}");
             part.headers
                 .insert("Proxy-Authorization", value.as_str())
                 .map_err(|e| HttpClientError::from_error(crate::ErrorKind::Request, e))?;
-            part_encoder = RequestEncoder::new(part);
         }
-        part_encoder.absolute_uri(true);
     }
+    let mut part_encoder = RequestEncoder::new(part);
+    part_encoder
+        .absolute_uri(conn.raw_mut().is_proxy() && request.uri().scheme() == Some(&Scheme::HTTP));
     loop {
         match part_encoder.encode(&mut buf[..]) {
             Ok(0) => break,
@@ -297,7 +297,7 @@ where
             written += read;
             end_body = end;
         }
-        if written == buf.len() || end_body {
+        if written == buf.len() || (end_body && written != 0) {
             conn.speed_controller.init_min_send_if_not_start();
             conn.speed_controller.init_max_send_if_not_start();
             let mut write_size = 0;

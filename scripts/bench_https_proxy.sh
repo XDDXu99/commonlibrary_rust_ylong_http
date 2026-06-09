@@ -3,6 +3,8 @@ set -euo pipefail
 
 REQUESTS=1000
 CONCURRENCY=10
+ROUNDS=1
+WARMUP_REQUESTS=0
 MODE="keep-alive"
 CLIENT="all"
 TARGET_PORT=18080
@@ -12,6 +14,7 @@ BODY_SIZE=1024
 PROXY_CA="ylong_http_client/tests/file/root-ca.pem"
 PROXY_CERT="ylong_http_client/tests/file/cert.pem"
 PROXY_KEY="ylong_http_client/tests/file/key.pem"
+RUNTIME_THREADS=""
 
 usage() {
     cat <<'USAGE'
@@ -20,6 +23,11 @@ Usage: scripts/bench_https_proxy.sh [options]
 Options:
   --requests N          Total request count. Default: 1000
   --concurrency N       Concurrent workers. Default: 10
+  --rounds N            Benchmark rounds; prints median totals when N > 1. Default: 1
+  --warmup-requests N   Untimed warmup requests per selected client. Default: 0
+  --runtime-threads N   Tokio worker threads for the local server and ylong client.
+  --official            Use the reproducible high-concurrency profile:
+                        100000 requests, concurrency 30, 5 rounds, 1000 warmup requests.
   --client NAME         ylong, curl-cli, libcurl, or all. Default: all
   --keep-alive          Reuse one HTTPS proxy connection per worker. Default.
   --cold                Create a fresh client/process per request.
@@ -43,6 +51,28 @@ while [[ $# -gt 0 ]]; do
         --concurrency)
             CONCURRENCY="$2"
             shift 2
+            ;;
+        --rounds)
+            ROUNDS="$2"
+            shift 2
+            ;;
+        --warmup-requests)
+            WARMUP_REQUESTS="$2"
+            shift 2
+            ;;
+        --runtime-threads)
+            RUNTIME_THREADS="$2"
+            shift 2
+            ;;
+        --official)
+            REQUESTS=100000
+            CONCURRENCY=30
+            ROUNDS=5
+            WARMUP_REQUESTS=1000
+            BODY_SIZE=1024
+            MODE="keep-alive"
+            CLIENT="all"
+            shift
             ;;
         --client)
             CLIENT="$2"
@@ -96,8 +126,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$REQUESTS" -le 0 || "$CONCURRENCY" -le 0 ]]; then
-    echo "requests and concurrency must be greater than zero" >&2
+if [[ "$REQUESTS" -le 0 || "$CONCURRENCY" -le 0 || "$ROUNDS" -le 0 || "$WARMUP_REQUESTS" -lt 0 ]]; then
+    echo "requests, concurrency, and rounds must be greater than zero; warmup requests cannot be negative" >&2
+    exit 2
+fi
+if [[ -n "$RUNTIME_THREADS" && "$RUNTIME_THREADS" -le 0 ]]; then
+    echo "runtime threads must be greater than zero" >&2
     exit 2
 fi
 
@@ -113,6 +147,10 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+
+if [[ -n "$RUNTIME_THREADS" ]]; then
+    export TOKIO_WORKER_THREADS="$RUNTIME_THREADS"
+fi
 
 BIN="$REPO_ROOT/target/release/examples/bench_https_proxy_ylong"
 LIBCURL_SRC="$REPO_ROOT/tools/bench_libcurl_https_proxy.c"
@@ -176,6 +214,7 @@ else
     echo "libcurl_version=unavailable"
 fi
 echo "client_selection=$CLIENT"
+echo "rounds=$ROUNDS warmup_requests=$WARMUP_REQUESTS runtime_threads=${RUNTIME_THREADS:-default}"
 
 run_curl_worker() {
     local count="$1"
@@ -302,6 +341,7 @@ build_libcurl_bench() {
 
 run_curl_cli() {
     echo "running curl CLI..."
+    rm -f "$TMP_DIR"/curl_*.times
     local start_ns end_ns curl_status
     start_ns="$(date +%s%N)"
     PIDS=()
@@ -379,28 +419,98 @@ YLONG_OUTPUT=""
 CURL_OUTPUT=""
 LIBCURL_OUTPUT=""
 
-if client_selected "ylong"; then
-    echo "running ylong_http_client..."
-    YLONG_OUTPUT="$("$BIN" ylong \
-        --target-url "$TARGET_URL" \
-        --proxy-url "$PROXY_URL" \
-        --proxy-ca "$PROXY_CA" \
-        --requests "$REQUESTS" \
-        --concurrency "$CONCURRENCY" \
-        --response-size "$BODY_SIZE" \
-        "$MODE_FLAG")"
-    echo "$YLONG_OUTPUT"
+RESULTS_FILE="$TMP_DIR/results.txt"
+
+run_selected_clients() {
+    local emit="$1"
+    YLONG_OUTPUT=""
+    CURL_OUTPUT=""
+    LIBCURL_OUTPUT=""
+
+    if client_selected "ylong"; then
+        [[ "$emit" == "yes" ]] && echo "running ylong_http_client..."
+        YLONG_OUTPUT="$("$BIN" ylong \
+            --target-url "$TARGET_URL" \
+            --proxy-url "$PROXY_URL" \
+            --proxy-ca "$PROXY_CA" \
+            --requests "$REQUESTS" \
+            --concurrency "$CONCURRENCY" \
+            --response-size "$BODY_SIZE" \
+            "$MODE_FLAG")"
+        [[ "$emit" == "yes" ]] && echo "$YLONG_OUTPUT"
+    fi
+
+    if client_selected "curl-cli"; then
+        CURL_OUTPUT="$(run_curl_cli)"
+        [[ "$emit" == "yes" ]] && echo "$CURL_OUTPUT"
+    fi
+
+    if client_selected "libcurl"; then
+        LIBCURL_OUTPUT="$(run_libcurl)"
+        [[ "$emit" == "yes" ]] && echo "$LIBCURL_OUTPUT"
+    fi
+
+    if [[ "$emit" == "yes" ]]; then
+        compare_outputs "curl_cli" "$CURL_OUTPUT"
+        compare_outputs "libcurl" "$LIBCURL_OUTPUT"
+        printf '%s\n' "$YLONG_OUTPUT" "$CURL_OUTPUT" "$LIBCURL_OUTPUT" \
+            | grep '^client=' >>"$RESULTS_FILE" || true
+    fi
+}
+
+if [[ "$WARMUP_REQUESTS" -gt 0 ]]; then
+    measured_requests="$REQUESTS"
+    REQUESTS="$WARMUP_REQUESTS"
+    echo "running untimed warmup..."
+    run_selected_clients "no"
+    REQUESTS="$measured_requests"
 fi
 
-if client_selected "curl-cli"; then
-    CURL_OUTPUT="$(run_curl_cli)"
-    echo "$CURL_OUTPUT"
-fi
+for ((round = 1; round <= ROUNDS; round++)); do
+    echo "benchmark_round=$round/$ROUNDS"
+    run_selected_clients "yes"
+done
 
-if client_selected "libcurl"; then
-    LIBCURL_OUTPUT="$(run_libcurl)"
-    echo "$LIBCURL_OUTPUT"
-fi
+median_field() {
+    local client="$1"
+    local field="$2"
+    awk -v client="$client" -v field="$field" '
+        $1 == "client=" client {
+            for (i = 1; i <= NF; i++) {
+                split($i, pair, "=")
+                if (pair[1] == field) {
+                    print pair[2]
+                }
+            }
+        }
+    ' "$RESULTS_FILE" | sort -n | awk '
+        { values[NR] = $1 }
+        END {
+            if (NR == 0) {
+                exit 1
+            }
+            if (NR % 2 == 1) {
+                printf "%.3f", values[(NR + 1) / 2]
+            } else {
+                printf "%.3f", (values[NR / 2] + values[NR / 2 + 1]) / 2
+            }
+        }
+    '
+}
 
-compare_outputs "curl_cli" "$CURL_OUTPUT"
-compare_outputs "libcurl" "$LIBCURL_OUTPUT"
+if [[ "$ROUNDS" -gt 1 ]]; then
+    for client in ylong curl-cli libcurl; do
+        if grep -q "^client=$client " "$RESULTS_FILE"; then
+            median_total="$(median_field "$client" total_ms)"
+            median_rps="$(median_field "$client" rps)"
+            echo "median client=$client rounds=$ROUNDS total_ms=$median_total rps=$median_rps"
+        fi
+    done
+    if grep -q '^client=ylong ' "$RESULTS_FILE" && grep -q '^client=libcurl ' "$RESULTS_FILE"; then
+        ylong_median="$(median_field ylong total_ms)"
+        libcurl_median="$(median_field libcurl total_ms)"
+        delta="$(awk -v ylong="$ylong_median" -v baseline="$libcurl_median" 'BEGIN { printf "%.3f", (baseline - ylong) * 100 / baseline }')"
+        reached="$(awk -v delta="$delta" 'BEGIN { print (delta >= 20.0) ? "yes" : "no" }')"
+        echo "median_comparison=ylong_vs_libcurl total_time_delta_pct=$delta reached_20pct=$reached"
+    fi
+fi

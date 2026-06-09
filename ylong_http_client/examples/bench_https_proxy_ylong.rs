@@ -19,6 +19,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::str;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openssl::ssl::{Ssl, SslAcceptor, SslFiletype, SslMethod};
@@ -409,6 +410,11 @@ async fn run_ylong(config: YlongBenchConfig) -> Result<(), BenchError> {
         return Err("requests and concurrency must be greater than zero".into());
     }
 
+    let shared_client = if config.keep_alive {
+        Some(Arc::new(build_client(&config)?))
+    } else {
+        None
+    };
     let started = Instant::now();
     let mut handles = Vec::with_capacity(config.concurrency);
     for worker in 0..config.concurrency {
@@ -417,8 +423,9 @@ async fn run_ylong(config: YlongBenchConfig) -> Result<(), BenchError> {
             continue;
         }
         let config = config.clone();
+        let client = shared_client.clone();
         handles.push(tokio::spawn(async move {
-            run_ylong_worker(config, count)
+            run_ylong_worker(config, count, client)
                 .await
                 .map(|report| (worker, report))
         }));
@@ -462,14 +469,10 @@ async fn run_ylong(config: YlongBenchConfig) -> Result<(), BenchError> {
 async fn run_ylong_worker(
     config: YlongBenchConfig,
     count: usize,
+    keep_alive_client: Option<Arc<Client>>,
 ) -> Result<WorkerReport, BenchError> {
     let mut latencies = Vec::with_capacity(count);
     let mut report = WorkerReport::default();
-    let keep_alive_client = if config.keep_alive {
-        Some(build_client(&config)?)
-    } else {
-        None
-    };
 
     for request_index in 0..count {
         let started = Instant::now();
@@ -503,7 +506,10 @@ async fn run_ylong_worker(
 
 fn build_client(config: &YlongBenchConfig) -> Result<Client, BenchError> {
     let proxy = Proxy::all(config.proxy_url.as_str()).build()?;
-    let mut builder = Client::builder().dns_resolver(LocalResolver).proxy(proxy);
+    let mut builder = Client::builder()
+        .dns_resolver(LocalResolver)
+        .proxy(proxy)
+        .max_h1_conn_number(config.concurrency);
     if let Some(path) = config.proxy_ca.as_deref() {
         builder = builder.proxy_tls_ca_file(path);
     }
