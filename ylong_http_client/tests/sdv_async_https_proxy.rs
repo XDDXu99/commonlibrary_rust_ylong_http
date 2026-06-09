@@ -225,6 +225,13 @@ async fn start_mtls_proxy(target: Option<SocketAddr>, status: u16) -> ProxyHandl
     start_proxy_with_client_auth(true, target, status, true).await
 }
 
+async fn start_chain_mtls_proxy(target: Option<SocketAddr>, status: u16) -> ProxyHandle {
+    let mut tls_config = ServerTlsConfig::default_server(false);
+    tls_config.client_ca_file = Some(cert_path("cert_chain/rootCA.crt.pem"));
+    tls_config.require_client_cert = true;
+    start_proxy_with_tls_config(Some(tls_config), target, status).await
+}
+
 async fn start_proxy_with_client_auth(
     tls: bool,
     target: Option<SocketAddr>,
@@ -713,6 +720,38 @@ async fn sdv_https_proxy_mtls_succeeds_with_client_certificate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdv_https_proxy_mtls_succeeds_with_client_certificate_chain() {
+    let mut proxy = start_chain_mtls_proxy(None, 200).await;
+    let proxy_url = format!("https://{TEST_HOST}:{}", proxy.port);
+    let proxy_config = Proxy::all(proxy_url.as_str()).build().unwrap();
+    let client = Client::builder()
+        .dns_resolver(LocalResolver)
+        .proxy(proxy_config)
+        .proxy_tls_ca_file(cert_path("root-ca.pem").as_str())
+        .proxy_tls_certificate_chain_file(cert_path("cert_chain/chain.crt.pem").as_str())
+        .proxy_tls_private_key_file(
+            cert_path("cert_chain/server.key.pem").as_str(),
+            TlsFileType::PEM,
+        )
+        .build()
+        .unwrap();
+    let request = Request::builder()
+        .method("GET")
+        .url(format!("http://{TEST_HOST}:80/data").as_str())
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client.request(request).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(proxy
+        .observed
+        .recv()
+        .await
+        .unwrap()
+        .starts_with(&format!("GET http://{TEST_HOST}:80/data HTTP/1.1\r\n")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sdv_https_proxy_mtls_fails_without_client_certificate() {
     let proxy = start_mtls_proxy(None, 200).await;
     let url = format!("http://{TEST_HOST}:80/data");
@@ -720,4 +759,45 @@ async fn sdv_https_proxy_mtls_fails_without_client_certificate() {
 
     let result = request_via_proxy(url, proxy_url, true, false, false, false, false).await;
     assert!(result.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdv_proxy_errors_do_not_expose_basic_auth() {
+    let mut proxy = start_proxy(true, None, 407).await;
+    let url = format!("https://{TEST_HOST}:443/secure");
+    let proxy_url = format!("https://{TEST_HOST}:{}", proxy.port);
+
+    let result = request_via_proxy(url, proxy_url, true, false, true, false, true).await;
+    let error = match result {
+        Err(error) => format!("{error:?}"),
+        Ok(_) => panic!("407 response unexpectedly succeeded"),
+    };
+    assert!(!error.contains("user"));
+    assert!(!error.contains("pass"));
+    assert!(!error.contains("dXNlcjpwYXNz"));
+
+    let connect = proxy.observed.recv().await.unwrap();
+    assert!(connect.contains(&format!("Proxy-Authorization: {PROXY_AUTH}\r\n")));
+}
+
+#[test]
+fn sdv_proxy_private_key_errors_do_not_expose_key_material() {
+    const SECRET: &str = "proxy-private-key-secret-material";
+    let path = std::env::temp_dir().join(format!(
+        "ylong-http-proxy-invalid-key-{}-{}.pem",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&path, format!("-----BEGIN PRIVATE KEY-----\n{SECRET}\n")).unwrap();
+
+    let result = Client::builder()
+        .proxy_tls_private_key_file(path.to_string_lossy().as_ref(), TlsFileType::PEM)
+        .build();
+    let _ = std::fs::remove_file(path);
+
+    let error = match result {
+        Err(error) => format!("{error:?}"),
+        Ok(_) => panic!("invalid proxy private key unexpectedly built a client"),
+    };
+    assert!(!error.contains(SECRET));
 }
