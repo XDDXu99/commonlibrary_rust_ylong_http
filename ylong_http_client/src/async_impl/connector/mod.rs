@@ -264,7 +264,9 @@ mod tls {
     use super::eyeballs_connect_with_owner;
     use super::{eyeballs_connect, Connector, HttpConnector};
     use crate::async_impl::connector::dns_query;
-    use crate::async_impl::connector::proxy::tunnel;
+    use crate::async_impl::connector::proxy::{
+        connect_transport, connect_tunnel, ProxyConnectInfo,
+    };
     use crate::async_impl::connector::stream::HttpStream;
     use crate::async_impl::mix::{MaybeTlsStream, MixStream};
     #[cfg(feature = "http3")]
@@ -282,14 +284,6 @@ mod tls {
     use std::time::Instant;
     use ylong_http::request::uri::{Scheme, Uri};
 
-    #[derive(Clone)]
-    struct ProxyConnectInfo {
-        scheme: Scheme,
-        authority: String,
-        host: String,
-        auth: Option<String>,
-    }
-
     impl Connector for HttpConnector {
         type Stream = HttpStream<MixStream>;
         type Future =
@@ -300,17 +294,11 @@ mod tls {
             let target_addr = uri.authority().unwrap().to_string();
             let target_host = uri.host().unwrap().to_string();
             let target_port = uri.port().unwrap().as_u16().unwrap();
-            let proxy = self.config.proxies.match_proxy(uri).map(|proxy| {
-                let info = proxy.intercept.proxy_info();
-                let proxy_uri = proxy.via_proxy(uri);
-                let authority = proxy_uri.authority().unwrap();
-                ProxyConnectInfo {
-                    scheme: info.scheme().clone(),
-                    authority: authority.to_string(),
-                    host: authority.host().as_str().to_string(),
-                    auth: info.basic_auth.as_ref().and_then(|v| v.to_string().ok()),
-                }
-            });
+            let proxy = self
+                .config
+                .proxies
+                .match_proxy(uri)
+                .map(|proxy| ProxyConnectInfo::new(proxy, uri));
             let addr = proxy
                 .as_ref()
                 .map(|proxy| proxy.authority.clone())
@@ -358,18 +346,10 @@ mod tls {
                         addr,
                     };
                     let proxy_auth = proxy.as_ref().and_then(|proxy| proxy.auth.clone());
-                    let stream = match proxy {
-                        Some(proxy) if proxy.scheme == Scheme::HTTPS => {
-                            let stream = proxy_tls_connect(
-                                proxy_tls,
-                                stream,
-                                proxy.host.as_str(),
-                                &mut time_group,
-                            )
-                            .await?;
-                            MixStream::Transport(MaybeTlsStream::Tls(stream))
-                        }
-                        Some(_) => MixStream::Transport(MaybeTlsStream::Plain(stream)),
+                    let stream = match proxy.as_ref() {
+                        Some(proxy) => MixStream::Transport(
+                            connect_transport(proxy_tls, stream, proxy, &mut time_group).await?,
+                        ),
                         None => MixStream::Http(stream),
                     };
                     let data = ConnData::builder()
@@ -506,17 +486,8 @@ mod tls {
         let proxy_auth = proxy.as_ref().and_then(|proxy| proxy.auth.clone());
 
         if let Some(proxy) = proxy {
-            let mut transport = if proxy.scheme == Scheme::HTTPS {
-                let stream =
-                    proxy_tls_connect(proxy_tls, tcp_stream, proxy.host.as_str(), &mut time_group)
-                        .await?;
-                MaybeTlsStream::Tls(stream)
-            } else {
-                MaybeTlsStream::Plain(tcp_stream)
-            };
-            tunnel(&mut transport, &host, port, proxy.auth.clone())
-                .await
-                .map_err(|e| HttpClientError::from_io_error(crate::ErrorKind::Connect, e))?;
+            let transport =
+                connect_tunnel(proxy_tls, tcp_stream, &proxy, &host, port, &mut time_group).await?;
 
             let pinned_key = config.pinning_host_match(target_addr.as_str());
             let mut stream = config
@@ -610,32 +581,5 @@ mod tls {
             .build(detail);
 
         Ok(HttpStream::new(MixStream::Https(stream), data))
-    }
-
-    async fn proxy_tls_connect(
-        config: TlsConfig,
-        stream: TcpStream,
-        host: &str,
-        time_group: &mut TimeGroup,
-    ) -> Result<AsyncSslStream<TcpStream>, HttpClientError> {
-        let mut stream = config
-            .ssl_new(host)
-            .and_then(|ssl| AsyncSslStream::new(ssl.into_inner(), stream, None))
-            .map_err(|e| {
-                HttpClientError::from_tls_error(
-                    crate::ErrorKind::Connect,
-                    Error::new(ErrorKind::Other, e),
-                )
-            })?;
-
-        time_group.set_tls_start(Instant::now());
-        Pin::new(&mut stream).connect().await.map_err(|e| {
-            HttpClientError::from_tls_error(
-                crate::ErrorKind::Connect,
-                Error::new(ErrorKind::Other, e),
-            )
-        })?;
-        time_group.set_tls_end(Instant::now());
-        Ok(stream)
     }
 }

@@ -14,8 +14,95 @@
 use std::error;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{Error, ErrorKind, Write};
+use std::pin::Pin;
+use std::time::Instant;
 
-use crate::runtime::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use ylong_http::request::uri::{Scheme, Uri};
+
+use crate::async_impl::mix::MaybeTlsStream;
+use crate::async_impl::ssl_stream::AsyncSslStream;
+use crate::runtime::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, TcpStream};
+use crate::util::proxy::Proxy;
+use crate::{HttpClientError, TimeGroup, TlsConfig};
+
+#[derive(Clone)]
+pub(crate) struct ProxyConnectInfo {
+    pub(crate) scheme: Scheme,
+    pub(crate) authority: String,
+    pub(crate) host: String,
+    pub(crate) auth: Option<String>,
+}
+
+impl ProxyConnectInfo {
+    pub(crate) fn new(proxy: &Proxy, uri: &Uri) -> Self {
+        let info = proxy.intercept.proxy_info();
+        let proxy_uri = proxy.via_proxy(uri);
+        let authority = proxy_uri.authority().unwrap();
+        Self {
+            scheme: info.scheme().clone(),
+            authority: authority.to_string(),
+            host: authority.host().as_str().to_string(),
+            auth: info
+                .basic_auth
+                .as_ref()
+                .and_then(|value| value.to_string().ok()),
+        }
+    }
+}
+
+pub(crate) async fn connect_transport(
+    config: TlsConfig,
+    stream: TcpStream,
+    proxy: &ProxyConnectInfo,
+    time_group: &mut TimeGroup,
+) -> Result<MaybeTlsStream<TcpStream>, HttpClientError> {
+    if proxy.scheme == Scheme::HTTPS {
+        proxy_tls_connect(config, stream, proxy.host.as_str(), time_group)
+            .await
+            .map(MaybeTlsStream::Tls)
+    } else {
+        Ok(MaybeTlsStream::Plain(stream))
+    }
+}
+
+pub(crate) async fn connect_tunnel(
+    config: TlsConfig,
+    stream: TcpStream,
+    proxy: &ProxyConnectInfo,
+    target_host: &str,
+    target_port: u16,
+    time_group: &mut TimeGroup,
+) -> Result<MaybeTlsStream<TcpStream>, HttpClientError> {
+    let mut transport = connect_transport(config, stream, proxy, time_group).await?;
+    tunnel(&mut transport, target_host, target_port, proxy.auth.clone())
+        .await
+        .map_err(|e| HttpClientError::from_io_error(crate::ErrorKind::Connect, e))?;
+    Ok(transport)
+}
+
+async fn proxy_tls_connect(
+    config: TlsConfig,
+    stream: TcpStream,
+    host: &str,
+    time_group: &mut TimeGroup,
+) -> Result<AsyncSslStream<TcpStream>, HttpClientError> {
+    let mut stream = config
+        .ssl_new(host)
+        .and_then(|ssl| AsyncSslStream::new(ssl.into_inner(), stream, None))
+        .map_err(|e| {
+            HttpClientError::from_tls_error(
+                crate::ErrorKind::Connect,
+                Error::new(ErrorKind::Other, e),
+            )
+        })?;
+
+    time_group.set_tls_start(Instant::now());
+    Pin::new(&mut stream).connect().await.map_err(|e| {
+        HttpClientError::from_tls_error(crate::ErrorKind::Connect, Error::new(ErrorKind::Other, e))
+    })?;
+    time_group.set_tls_end(Instant::now());
+    Ok(stream)
+}
 
 pub(crate) async fn tunnel<S>(
     conn: &mut S,
