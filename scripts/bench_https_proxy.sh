@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export RUSTFLAGS="${RUSTFLAGS:--Awarnings}"
 
 REQUESTS=1000
 CONCURRENCY=10
@@ -10,10 +11,15 @@ CLIENT="all"
 TARGET_PORT=18080
 PROXY_PORT=18443
 PROXY_HOST="foobar.com"
+TARGET_HOST="foobar.com"
+TARGET_SCHEME="http"
 BODY_SIZE=1024
 PROXY_CA="ylong_http_client/tests/file/root-ca.pem"
 PROXY_CERT="ylong_http_client/tests/file/cert.pem"
 PROXY_KEY="ylong_http_client/tests/file/key.pem"
+TARGET_CA="ylong_http_client/tests/file/root-ca.pem"
+TARGET_CERT="ylong_http_client/tests/file/cert.pem"
+TARGET_KEY="ylong_http_client/tests/file/key.pem"
 RUNTIME_THREADS=""
 
 usage() {
@@ -32,6 +38,11 @@ Options:
   --keep-alive          Reuse one HTTPS proxy connection per worker. Default.
   --cold                Create a fresh client/process per request.
   --target-port PORT    Local HTTP target port. Default: 18080
+  --target-scheme NAME  Target scheme: http or https. Default: http
+  --target-host HOST    Hostname used for target TLS verification. Default: foobar.com
+  --target-ca PATH      CA file used to verify an HTTPS target.
+  --target-cert PATH    Local HTTPS target certificate.
+  --target-key PATH     Local HTTPS target private key.
   --proxy-port PORT     Local HTTPS proxy port. Default: 18443
   --proxy-host HOST     Hostname used for proxy certificate verification. Default: foobar.com
   --proxy-ca PATH       CA file used to verify the HTTPS proxy. Default: ylong_http_client/tests/file/root-ca.pem
@@ -90,6 +101,26 @@ while [[ $# -gt 0 ]]; do
             TARGET_PORT="$2"
             shift 2
             ;;
+        --target-scheme)
+            TARGET_SCHEME="$2"
+            shift 2
+            ;;
+        --target-host)
+            TARGET_HOST="$2"
+            shift 2
+            ;;
+        --target-ca)
+            TARGET_CA="$2"
+            shift 2
+            ;;
+        --target-cert)
+            TARGET_CERT="$2"
+            shift 2
+            ;;
+        --target-key)
+            TARGET_KEY="$2"
+            shift 2
+            ;;
         --proxy-port)
             PROXY_PORT="$2"
             shift 2
@@ -134,6 +165,10 @@ if [[ -n "$RUNTIME_THREADS" && "$RUNTIME_THREADS" -le 0 ]]; then
     echo "runtime threads must be greater than zero" >&2
     exit 2
 fi
+if [[ "$TARGET_SCHEME" != "http" && "$TARGET_SCHEME" != "https" ]]; then
+    echo "target scheme must be http or https" >&2
+    exit 2
+fi
 
 case "$CLIENT" in
     ylong|curl-cli|libcurl|all)
@@ -175,6 +210,9 @@ cargo build --release -p ylong_http_client --features async,tokio_base,http1_1,t
     --proxy-addr "127.0.0.1:$PROXY_PORT" \
     --cert "$PROXY_CERT" \
     --key "$PROXY_KEY" \
+    --target-scheme "$TARGET_SCHEME" \
+    --target-cert "$TARGET_CERT" \
+    --target-key "$TARGET_KEY" \
     --body-size "$BODY_SIZE" \
     >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID="$!"
@@ -196,7 +234,7 @@ if ! grep -q '^READY ' "$TMP_DIR/server.log"; then
     exit 1
 fi
 
-TARGET_URL="http://$PROXY_HOST:$TARGET_PORT/bench"
+TARGET_URL="$TARGET_SCHEME://$TARGET_HOST:$TARGET_PORT/bench"
 PROXY_URL="https://$PROXY_HOST:$PROXY_PORT"
 MODE_FLAG="--keep-alive"
 if [[ "$MODE" == "cold" ]]; then
@@ -206,6 +244,7 @@ fi
 echo "server=$(grep '^READY ' "$TMP_DIR/server.log" | tail -1)"
 echo "ylong_build=release binary=$BIN"
 echo "target_url=$TARGET_URL"
+echo "target_scheme=$TARGET_SCHEME"
 echo "proxy_url=$PROXY_URL"
 echo "curl_version=$(curl --version | sed -n '1p')"
 if command -v curl-config >/dev/null 2>&1; then
@@ -236,6 +275,7 @@ run_curl_worker() {
             --write-out '%{time_total} %{size_download}\n' \
             --proxy "$PROXY_URL" \
             --proxy-cacert "$PROXY_CA" \
+            --cacert "$TARGET_CA" \
             --resolve "$resolve" \
             "${urls[@]}" >"$output"
     else
@@ -247,6 +287,7 @@ run_curl_worker() {
                 --write-out '%{time_total} %{size_download}\n' \
                 --proxy "$PROXY_URL" \
                 --proxy-cacert "$PROXY_CA" \
+                --cacert "$TARGET_CA" \
                 --resolve "$resolve" \
                 "$TARGET_URL" >>"$output"
         done
@@ -390,6 +431,7 @@ run_libcurl() {
         --target-url "$TARGET_URL" \
         --proxy-url "$PROXY_URL" \
         --proxy-ca "$PROXY_CA" \
+        --target-ca "$TARGET_CA" \
         --resolve "$PROXY_HOST:$PROXY_PORT:127.0.0.1" \
         --requests "$REQUESTS" \
         --concurrency "$CONCURRENCY" \
@@ -433,6 +475,7 @@ run_selected_clients() {
             --target-url "$TARGET_URL" \
             --proxy-url "$PROXY_URL" \
             --proxy-ca "$PROXY_CA" \
+            --target-ca "$TARGET_CA" \
             --requests "$REQUESTS" \
             --concurrency "$CONCURRENCY" \
             --response-size "$BODY_SIZE" \

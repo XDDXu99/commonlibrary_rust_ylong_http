@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Local HTTPS proxy benchmark helper for HTTP target requests.
+//! Local HTTPS proxy benchmark helper for HTTP and HTTPS target requests.
 
 use std::env;
 use std::error::Error;
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openssl::ssl::{Ssl, SslAcceptor, SslFiletype, SslMethod};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_openssl::SslStream;
 use ylong_http_client::async_impl::{
@@ -60,6 +60,7 @@ struct YlongBenchConfig {
     target_url: String,
     proxy_url: String,
     proxy_ca: Option<String>,
+    target_ca: Option<String>,
     proxy_insecure: bool,
     requests: usize,
     concurrency: usize,
@@ -86,9 +87,35 @@ async fn main() -> Result<(), BenchError> {
             let proxy_addr = arg_value(&args, "--proxy-addr", DEFAULT_PROXY_ADDR);
             let cert = arg_value(&args, "--cert", "ylong_http_client/tests/file/cert.pem");
             let key = arg_value(&args, "--key", "ylong_http_client/tests/file/key.pem");
+            let target_scheme = arg_value(&args, "--target-scheme", "http");
+            let target_cert = arg_value(
+                &args,
+                "--target-cert",
+                "ylong_http_client/tests/file/cert.pem",
+            );
+            let target_key = arg_value(
+                &args,
+                "--target-key",
+                "ylong_http_client/tests/file/key.pem",
+            );
             let body_size = arg_value(&args, "--body-size", DEFAULT_BODY_SIZE.to_string().as_str())
                 .parse::<usize>()?;
-            run_servers(&target_addr, &proxy_addr, &cert, &key, body_size).await
+            let target_tls = match target_scheme.as_str() {
+                "http" => false,
+                "https" => true,
+                _ => return Err("target scheme must be http or https".into()),
+            };
+            run_servers(
+                &target_addr,
+                &proxy_addr,
+                &cert,
+                &key,
+                target_tls,
+                &target_cert,
+                &target_key,
+                body_size,
+            )
+            .await
         }
         Some("ylong") => {
             let requests = arg_value(&args, "--requests", "1000").parse::<usize>()?;
@@ -97,6 +124,7 @@ async fn main() -> Result<(), BenchError> {
                 target_url: arg_value(&args, "--target-url", "http://foobar.com:18080/bench"),
                 proxy_url: arg_value(&args, "--proxy-url", "https://foobar.com:18443"),
                 proxy_ca: optional_arg(&args, "--proxy-ca"),
+                target_ca: optional_arg(&args, "--target-ca"),
                 proxy_insecure: has_flag(&args, "--proxy-insecure"),
                 requests,
                 concurrency,
@@ -120,8 +148,10 @@ async fn main() -> Result<(), BenchError> {
 fn print_usage() {
     eprintln!(
         "Usage:\n  bench_https_proxy_ylong serve [--target-addr ADDR] [--proxy-addr ADDR] \\
-         [--cert PEM] [--key PEM] [--body-size N]\n  bench_https_proxy_ylong ylong \\
-         --target-url URL --proxy-url URL [--proxy-ca PEM|--proxy-insecure] \\
+         [--cert PEM] [--key PEM] [--target-scheme http|https] \\
+         [--target-cert PEM] [--target-key PEM] [--body-size N]\n  bench_https_proxy_ylong ylong \\
+         --target-url URL --proxy-url URL [--proxy-ca PEM] [--target-ca PEM] \\
+         [--proxy-insecure] \\
          --requests N --concurrency N [--response-size N] [--keep-alive|--cold]"
     );
 }
@@ -145,6 +175,9 @@ async fn run_servers(
     proxy_addr: &str,
     cert: &str,
     key: &str,
+    target_tls: bool,
+    target_cert: &str,
+    target_key: &str,
     body_size: usize,
 ) -> Result<(), BenchError> {
     let target = TcpListener::bind(target_addr).await?;
@@ -152,20 +185,27 @@ async fn run_servers(
     let target_addr = target.local_addr()?;
     let proxy_addr = proxy.local_addr()?;
     let body = vec![b'x'; body_size];
-    let acceptor = tls_acceptor(cert, key)?;
+    let proxy_acceptor = tls_acceptor(cert, key)?;
+    let target_acceptor = target_tls
+        .then(|| tls_acceptor(target_cert, target_key))
+        .transpose()?
+        .map(Arc::new);
 
     println!(
-        "READY target={} proxy={} body_size={}",
-        target_addr, proxy_addr, body_size
+        "READY target={} target_scheme={} proxy={} body_size={}",
+        target_addr,
+        if target_tls { "https" } else { "http" },
+        proxy_addr,
+        body_size
     );
 
     tokio::spawn(async move {
-        if let Err(err) = accept_target_loop(target, body).await {
+        if let Err(err) = accept_target_loop(target, body, target_acceptor).await {
             eprintln!("target server stopped: {err}");
         }
     });
 
-    accept_proxy_loop(proxy, acceptor).await
+    accept_proxy_loop(proxy, proxy_acceptor).await
 }
 
 fn tls_acceptor(cert: &str, key: &str) -> Result<SslAcceptor, BenchError> {
@@ -175,21 +215,40 @@ fn tls_acceptor(cert: &str, key: &str) -> Result<SslAcceptor, BenchError> {
     Ok(builder.build())
 }
 
-async fn accept_target_loop(listener: TcpListener, body: Vec<u8>) -> Result<(), BenchError> {
-    let body = std::sync::Arc::new(body);
+async fn accept_target_loop(
+    listener: TcpListener,
+    body: Vec<u8>,
+    acceptor: Option<Arc<SslAcceptor>>,
+) -> Result<(), BenchError> {
+    let body = Arc::new(body);
     loop {
         let (stream, _) = listener.accept().await?;
         let body = body.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            let _ = handle_target_connection(stream, body).await;
+            if let Some(acceptor) = acceptor {
+                let result = async {
+                    let ssl = Ssl::new(acceptor.context())?;
+                    let mut stream = SslStream::new(ssl, stream)?;
+                    Pin::new(&mut stream).accept().await?;
+                    handle_target_connection(stream, body).await?;
+                    Ok::<(), BenchError>(())
+                }
+                .await;
+                if let Err(err) = result {
+                    eprintln!("HTTPS target connection failed: {err}");
+                }
+            } else {
+                let _ = handle_target_connection(stream, body).await;
+            }
         });
     }
 }
 
-async fn handle_target_connection(
-    mut stream: TcpStream,
-    body: std::sync::Arc<Vec<u8>>,
-) -> io::Result<()> {
+async fn handle_target_connection<S>(mut stream: S, body: Arc<Vec<u8>>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         let Some(head) = read_headers(&mut stream).await? else {
             return Ok(());
@@ -231,12 +290,23 @@ async fn handle_proxy_connection(
     let mut client = SslStream::new(ssl, stream)?;
     Pin::new(&mut client).accept().await?;
 
+    let Some(mut head) = read_headers(&mut client).await? else {
+        return Ok(());
+    };
+    if is_connect_request(&head) {
+        let authority = parse_connect_authority(&head)?;
+        let mut target = connect_loopback(&authority).await?;
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        client.flush().await?;
+        tokio::io::copy_bidirectional(&mut client, &mut target).await?;
+        return Ok(());
+    }
+
     let mut target_authority = String::new();
     let mut target = None;
     loop {
-        let Some(head) = read_headers(&mut client).await? else {
-            return Ok(());
-        };
         let (authority, rewritten) = rewrite_proxy_request(&head)?;
         if target_authority != authority {
             target = Some(connect_loopback(&authority).await?);
@@ -265,7 +335,35 @@ async fn handle_proxy_connection(
         let response = read_response(target.as_mut().expect("target stream must exist")).await?;
         client.write_all(&response).await?;
         client.flush().await?;
+        let Some(next_head) = read_headers(&mut client).await? else {
+            return Ok(());
+        };
+        head = next_head;
     }
+}
+
+fn is_connect_request(head: &[u8]) -> bool {
+    head.starts_with(b"CONNECT ")
+}
+
+fn parse_connect_authority(head: &[u8]) -> io::Result<String> {
+    let text =
+        str::from_utf8(head).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let request_line = text
+        .split("\r\n")
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing CONNECT line"))?;
+    let mut parts = request_line.split_whitespace();
+    if parts.next() != Some("CONNECT") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected CONNECT request",
+        ));
+    }
+    parts
+        .next()
+        .map(str::to_string)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing CONNECT authority"))
 }
 
 async fn connect_loopback(authority: &str) -> io::Result<TcpStream> {
@@ -512,6 +610,9 @@ fn build_client(config: &YlongBenchConfig) -> Result<Client, BenchError> {
         .max_h1_conn_number(config.concurrency);
     if let Some(path) = config.proxy_ca.as_deref() {
         builder = builder.proxy_tls_ca_file(path);
+    }
+    if let Some(path) = config.target_ca.as_deref() {
+        builder = builder.tls_ca_file(path);
     }
     if config.proxy_insecure {
         builder = builder

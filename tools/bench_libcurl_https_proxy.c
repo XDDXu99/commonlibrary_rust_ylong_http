@@ -1,5 +1,5 @@
 /*
- * Local libcurl multi benchmark for HTTP over HTTPS proxy.
+ * Local libcurl multi benchmark for HTTP or HTTPS over HTTPS proxy.
  *
  * The program is intentionally standalone so the benchmark does not add Rust
  * crate dependencies. It expects the local target/proxy servers to be started
@@ -16,6 +16,7 @@ typedef struct {
     const char *target_url;
     const char *proxy_url;
     const char *proxy_ca;
+    const char *target_ca;
     const char *resolve;
     long requests;
     long concurrency;
@@ -56,6 +57,7 @@ static void usage(const char *program)
 {
     fprintf(stderr,
         "Usage: %s --target-url URL --proxy-url URL --proxy-ca PEM "
+        "[--target-ca PEM] "
         "--requests N --concurrency N [--response-size N] "
         "[--resolve HOST:PORT:ADDR] [--keep-alive|--cold] [--proxy-insecure]\n",
         program);
@@ -163,6 +165,9 @@ static int configure_easy(CURLM *multi, Slot *slot, const Config *config, struct
     curl_easy_setopt(slot->easy, CURLOPT_PROXY_SSL_VERIFYHOST, config->proxy_insecure ? 0L : 2L);
     if (config->proxy_ca != NULL && config->proxy_ca[0] != '\0') {
         curl_easy_setopt(slot->easy, CURLOPT_PROXY_CAINFO, config->proxy_ca);
+    }
+    if (config->target_ca != NULL && config->target_ca[0] != '\0') {
+        curl_easy_setopt(slot->easy, CURLOPT_CAINFO, config->target_ca);
     }
     if (resolve != NULL) {
         curl_easy_setopt(slot->easy, CURLOPT_RESOLVE, resolve);
@@ -285,6 +290,7 @@ int main(int argc, char **argv)
     config.target_url = arg_value(argc, argv, "--target-url", NULL);
     config.proxy_url = arg_value(argc, argv, "--proxy-url", NULL);
     config.proxy_ca = arg_value(argc, argv, "--proxy-ca", "");
+    config.target_ca = arg_value(argc, argv, "--target-ca", "");
     config.resolve = arg_value(argc, argv, "--resolve", NULL);
     config.requests = parse_positive_long(arg_value(argc, argv, "--requests", "0"), "requests");
     config.concurrency = parse_positive_long(arg_value(argc, argv, "--concurrency", "0"), "concurrency");
