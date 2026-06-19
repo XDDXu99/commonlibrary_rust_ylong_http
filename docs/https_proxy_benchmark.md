@@ -120,8 +120,11 @@ median_comparison=ylong_vs_libcurl total_time_delta_pct=... reached_20pct=...
 - 本地 target/proxy 是简化 mock server，适合可复现对照，不代表公网代理环境。
 - 本机已通过 libcurl multi 实测；curl CLI 仍只作为 smoke benchmark，最终对照优先看
   libcurl multi。
+- 不同网络延迟场景尚未覆盖；当前未使用 `tc netem`、mock delay 或脚本延迟注入。
 - 尚未采集 CPU time、context switch 和内存分配。256KB 结果轮间波动较大，应结合更多轮次
   和系统级 profiler 解读。
+- TLS session resume、zero-copy / 减少拷贝和 batching 仍是后续优化方向，当前性能验证
+  未为追求速度关闭 TLS 校验、hostname verification 或 CONNECT 安全检查。
 
 ## 本机验证结果
 
@@ -137,8 +140,9 @@ ylong build: release
 libcurl build: cc -O2 with pkg-config cflags/libs
 ```
 
-当前结果均来自 release ylong helper 和 `cc -O2` libcurl 程序。Cargo 构建默认使用
-`RUSTFLAGS=-Awarnings` 屏蔽仓库既有 warning。正式高并发命令为：
+当前结果均来自 release ylong helper 和 `cc -O2` libcurl 程序。benchmark 脚本会默认
+设置 `RUSTFLAGS=-Awarnings` 以屏蔽仓库既有 warning；该变量只用于本地输出降噪，不是
+官方构建要求。正式高并发命令为：
 
 ```bash
 scripts/bench_https_proxy.sh --official
@@ -152,31 +156,25 @@ scripts/bench_https_proxy.sh --requests 100 --concurrency 10 --rounds 5 --cold
 
 | 场景 | ylong ms / RPS | curl CLI ms / RPS | libcurl ms / RPS | ylong 相对 libcurl |
 | --- | ---: | ---: | ---: | ---: |
-| HTTP target，100000 req，c30，1KB，keep-alive | 1291.965 / 77401.480 | 2400.060 / 41665.625 | 1826.138 / 54760.389 | 快 `29.252%` |
-| HTTPS target，10000 req，c30，1KB，keep-alive | 107.754 / 92804.193 | 218.177 / 45834.346 | 233.698 / 42790.306 | 快 `53.892%` |
-| HTTP target，3000 req，c30，64KB，keep-alive | 4429.917 / 677.214 | 4573.500 / 655.953 | 4454.550 / 673.469 | 快 `0.553%` |
-| HTTP target，1000 req，c30，256KB，keep-alive | 1259.415 / 794.020 | 1368.003 / 730.993 | 1196.311 / 835.903 | 慢 `5.275%` |
-| HTTP target，100 req，c10，1KB，cold | 95.209 / 1050.320 | 141.839 / 705.025 | 100.169 / 998.315 | 快 `4.952%` |
+| HTTP target，100000 req，c30，1KB，keep-alive | 1117.971 / 89447.728 | 1974.967 / 50633.757 | 1719.869 / 58143.977 | 快 `34.997%` |
+| HTTPS target，10000 req，c30，1KB，keep-alive | 100.167 / 99833.169 | 218.457 / 45775.599 | 227.900 / 43878.829 | 快 `56.048%` |
+| HTTP target，3000 req，c30，64KB，keep-alive | 4442.721 / 675.262 | 4571.824 / 656.193 | 4440.869 / 675.543 | 慢 `0.042%` |
+| HTTP target，1000 req，c30，256KB，keep-alive | 1289.694 / 775.378 | 1463.369 / 683.355 | 1189.492 / 840.695 | 慢 `8.424%` |
+| HTTP target，100 req，c10，1KB，cold | 93.722 / 1066.981 | 116.342 / 859.535 | 94.366 / 1059.700 | 快 `0.682%` |
 
-关键诊断字段中位数：
+正式 20%+ 结论仅限：
 
-| 场景 | client | first_request_ms | steady_avg_ms |
-| --- | --- | ---: | ---: |
-| HTTP 1KB official | ylong | 9.509 | 0.382 |
-| HTTP 1KB official | libcurl | 30.208 | 0.538 |
-| HTTPS target 1KB | ylong | 14.039 | 0.261 |
-| HTTPS target 1KB | libcurl | 58.281 | 0.527 |
-| HTTP 64KB | ylong | 18.793 | 43.831 |
-| HTTP 64KB | libcurl | 33.875 | 44.111 |
-| HTTP 256KB | ylong | 26.627 | 29.656 |
-| HTTP 256KB | libcurl | 37.544 | 24.610 |
-| HTTP 1KB cold | ylong | 34.599 | 5.845 |
-| HTTP 1KB cold | libcurl | 11.229 | 9.738 |
+- HTTP target over HTTPS proxy，100000 请求、并发 30、1KB、keep-alive，
+  ylong 相对 libcurl multi 快 `34.997%`。
+- HTTPS target over HTTPS proxy，10000 请求、并发 30、1KB、keep-alive，
+  ylong 相对 libcurl multi 快 `56.048%`。
 
-结论：HTTP target 的正式高并发小响应场景和 HTTPS target 双层 TLS 场景均达到 20%+。
-64KB 基本持平，256KB 和 cold 未达到。cold 的 `first_request_ms` 只表示每个 worker 的
-首个冷请求，不能等同于唯一的建连样本。历史并发 10、100000 请求结果仍慢 `5.122%`，
-因此不能宣称所有 HTTPS proxy 参数下均有 20%+ 提升。
+64KB 基本持平，256KB 场景 ylong 慢于 libcurl，cold 场景不作为正式达标证据。
+不同网络延迟场景未覆盖，因此不能宣称所有 HTTPS proxy 参数下均有 20%+ 提升。
+
+脚本仍会输出 `first_request_ms`、`steady_avg_ms`、`p95_ms`、`p99_ms`、错误数和
+body 字节数等诊断字段，用于定位建连成本、稳定态请求延迟和 body drain 成本。最新审计的
+正式达标判断只采用五轮 `total_ms` 中位数，不使用单轮最好值。
 
 ## 后续优化方向
 

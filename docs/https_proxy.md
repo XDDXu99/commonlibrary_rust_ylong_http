@@ -79,15 +79,32 @@ proxy authority、proxy basic auth，以及 Client 构建时生成的 TLS 配置
 ## Benchmark 状态
 
 仓库提供本地可复现的 ylong、curl CLI 和 libcurl multi 对照，详见
-[`https_proxy_benchmark.md`](https_proxy_benchmark.md)。2026-06-09 的五轮中位数复测中，
-HTTP target、100000 请求、并发 30、1KB、keep-alive 场景下，ylong 总耗时
-`1291.965ms`，libcurl 为 `1826.138ms`，ylong 快 `29.252%`，达到该限定场景的 20%+
-目标。
+[`https_proxy_benchmark.md`](https_proxy_benchmark.md)。最新审计采用 libcurl multi
+五轮 `total_ms` 中位数作为正式对照，两个高并发 1KB keep-alive 场景达到 20%+：
 
-该结论不能泛化到所有参数。64KB 场景基本持平，256KB 和低并发历史结果未达到 20%；
-文档同时保留 cold 与 HTTPS target over HTTPS proxy 的实测数据。
+- HTTP target over HTTPS proxy，100000 请求、并发 30、1KB、keep-alive：
+  ylong `1117.971ms`，libcurl `1719.869ms`，ylong 快 `34.997%`。
+- HTTPS target over HTTPS proxy，10000 请求、并发 30、1KB、keep-alive：
+  ylong `100.167ms`，libcurl `227.900ms`，ylong 快 `56.048%`。
+
+该结论不能泛化到所有参数。64KB 场景基本持平，256KB 场景 ylong 慢于 libcurl，
+cold 场景不作为正式达标证据。当前 benchmark 也未覆盖不同网络延迟条件。
 
 ## 构建说明
 
 启用 C OpenSSL TLS 能力时，`build.rs` 会自动链接 `ssl` 和 `crypto`。如果本机
 OpenSSL 库不在平台默认搜索路径中，可以通过 `OPENSSL_LIB_DIR` 指定库目录。
+Ubuntu/WSL 常见复现方式为：
+
+```bash
+OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu cargo build -p ylong_http_client \
+  --features "async,http1_1,tokio_base,tls_default"
+```
+
+```bash
+OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu cargo build -p ylong_http_client \
+  --features "async,http1_1,http2,ylong_base,tls_default"
+```
+
+如果 OpenSSL 安装在非默认位置，应按本机路径设置 `OPENSSL_LIB_DIR`，必要时同时设置
+`OPENSSL_INCLUDE_DIR` 或 `OPENSSL_DIR`。
